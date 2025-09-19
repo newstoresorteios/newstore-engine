@@ -28,7 +28,7 @@ jobs:
           SMTP_PORT: "587"
           SMTP_USER: "9712be001@smtp-brevo.com"
           SMTP_PASS: "aVAwYKIWRD8hx47p"
-          COMMIT: "false"   # mude para "true" depois de testar
+          COMMIT: "true"   # mude para "true" depois de testar
           SMTP_NAME: "NewStore Sorteios"
           APP_NAME: "NewStore Sorteios"
           ADMIN_EMAIL: "newrecreio@gmail.com"
