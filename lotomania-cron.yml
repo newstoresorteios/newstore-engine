@@ -32,7 +32,7 @@ jobs:
           SMTP_PASS: "aVAwYKIWRD8hx47p"
 
           # ---- VARIÁVEIS NÃO SECRETAS ----
-          COMMIT: "true"                         # "false" para dry-run (sem gravar no DB)
+          COMMIT: "false"                         # "false" para dry-run (sem gravar no DB)
           SMTP_NAME: "NewStore Sorteios"
           APP_NAME: "NewStore Sorteios"
           ADMIN_EMAIL: "newrecreio@gmail.com"
