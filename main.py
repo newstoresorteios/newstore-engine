@@ -6,6 +6,11 @@ from psycopg2.extras import RealDictCursor
 import requests
 from datetime import datetime, timezone
 
+# >>> NOVO: utilidades para limpar a URL do Postgres e mascarar senha nos logs
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+import re
+# <<< NOVO
+
 # --------- ENV ---------
 DB_URL = os.getenv("POSTGRES_URL", "")
 COMMIT = os.getenv("COMMIT", "false").lower() in ("1", "true", "yes")
@@ -22,6 +27,28 @@ APP_NAME  = os.getenv("APP_NAME",  "NewStore Sorteios")
 
 # Aviso administrativo quando fechar sorteio
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "newrecreio@gmail.com")
+
+# --------- helpers NOVOS (PG URL) ---------
+def _mask_pg_url(u: str) -> str:
+    """Mascara a senha ao imprimir a URL no log."""
+    return re.sub(r'://([^:]+):[^@]+@', r'://\1:***@', u or "")
+
+def _clean_pg_url(u: str) -> str:
+    """
+    Remove parâmetros não suportados pelo libpq/psycopg2 (ex.: 'supa').
+    Mantém apenas chaves comuns/seguras.
+    """
+    if not u:
+        return u
+    parts = urlsplit(u)
+    q = dict(parse_qsl(parts.query or "", keep_blank_values=True))
+    allowed = {
+        "sslmode", "ssl", "sslrootcert", "connect_timeout",
+        "target_session_attrs", "application_name", "options"
+    }
+    q = {k: v for k, v in q.items() if k in allowed}
+    new_query = urlencode(q)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
 
 # --------- E-MAIL ---------
 def _smtp_send(to_email: str, subject: str, body: str):
@@ -76,7 +103,11 @@ Data/Hora (UTC): {datetime.utcnow().isoformat()}Z
 
 # --------- DB helpers ---------
 def db():
-    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor, sslmode="require")
+    # >>> NOVO: limpa a URL e loga (mascarado)
+    pg_url = _clean_pg_url(DB_URL)
+    print("[db] usando POSTGRES_URL:", _mask_pg_url(pg_url))
+    # <<< NOVO
+    return psycopg2.connect(pg_url, cursor_factory=RealDictCursor, sslmode="require")
 
 def get_open_draws(conn):
     with conn.cursor() as cur:
