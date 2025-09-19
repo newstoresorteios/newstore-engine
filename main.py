@@ -174,15 +174,43 @@ def get_user_email(conn, user_id: int):
 
 def paid_user_for_number(conn, draw_id: int, number: int):
     with conn.cursor() as cur:
+        # Descobre as colunas disponíveis
         cur.execute("""
-            SELECT r.user_id
-              FROM reservations r
-         LEFT JOIN payments p ON p.id = r.payment_id
-             WHERE r.draw_id = %s
-               AND r.numbers  = %s
-               AND (r.status = 'paid' OR p.status = 'approved')
-             LIMIT 1
-        """, (draw_id, number))
+            SELECT column_name, data_type
+              FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND table_name   = 'reservations'
+        """)
+        cols = {row["column_name"]: row["data_type"] for row in cur.fetchall()}
+
+        if "number" in cols:
+            # Coluna única 'number' (int)
+            query = """
+                SELECT r.user_id
+                  FROM reservations r
+             LEFT JOIN payments p ON p.id = r.payment_id
+                 WHERE r.draw_id = %s
+                   AND r.number  = %s
+                   AND (r.status = 'paid' OR p.status = 'approved')
+                 LIMIT 1
+            """
+            params = (draw_id, number)
+        elif "numbers" in cols:
+            # Coluna 'numbers' (int[]) -> checar se o inteiro está contido no array
+            query = """
+                SELECT r.user_id
+                  FROM reservations r
+             LEFT JOIN payments p ON p.id = r.payment_id
+                 WHERE r.draw_id = %s
+                   AND ( %s = ANY(r.numbers) OR r.numbers @> ARRAY[%s]::int[] )
+                   AND (r.status = 'paid' OR p.status = 'approved')
+                 LIMIT 1
+            """
+            params = (draw_id, number, number)
+        else:
+            raise RuntimeError("Tabela reservations não possui colunas 'number' nem 'numbers'.")
+
+        cur.execute(query, params)
         r = cur.fetchone()
         return r["user_id"] if r else None
 
