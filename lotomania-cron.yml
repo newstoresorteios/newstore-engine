@@ -22,29 +22,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Confirma o valor que chegou (mascara a senha)
-      - name: Debug POSTGRES_URL (mascarado)
-        run: |
-          python - <<'PY'
-          import os, re
-          u = os.getenv("POSTGRES_URL","")
-          u_mask = re.sub(r'://([^:]+):[^@]+@', r'://\\1:***@', u)
-          print("POSTGRES_URL efetivo:", u_mask)
-          PY
+      - name: Run script (forçando POSTGRES_URL correto)
         env:
-          POSTGRES_URL: "postgres://postgres.mgwvavsjxzwflibcjzhd:CtPrJ5nOpomcjuJV@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require"
-
-      - name: Run script
-        env:
-          POSTGRES_URL: "postgres://postgres.mgwvavsjxzwflibcjzhd:CtPrJ5nOpomcjuJV@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require"
           SMTP_HOST: "smtp-relay.brevo.com"
           SMTP_PORT: "587"
           SMTP_USER: "9712be001@smtp-brevo.com"
           SMTP_PASS: "aVAwYKIWRD8hx47p"
-
-          COMMIT: "false"   # mude para "true" depois do teste
+          COMMIT: "false"   # mude para "true" depois de testar
           SMTP_NAME: "NewStore Sorteios"
           APP_NAME: "NewStore Sorteios"
           ADMIN_EMAIL: "newrecreio@gmail.com"
           LOTOMANIA_ENDPOINT: "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotomania"
-        run: python main.py
+        run: |
+          # define e imprime (mascarado) a URL que SERÁ usada
+          export POSTGRES_URL="postgres://postgres.mgwvavsjxzwflibcjzhd:CtPrJ5nOpomcjuJV@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require"
+          python - <<'PY'
+          import os, re
+          u = os.getenv("POSTGRES_URL","")
+          u_mask = re.sub(r'://([^:]+):[^@]+@', r'://\\1:***@', u)
+          print("POSTGRES_URL que será usado:", u_mask)
+          PY
+
+          # executa
+          python main.py
