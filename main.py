@@ -179,7 +179,7 @@ def paid_user_for_number(conn, draw_id: int, number: int):
               FROM reservations r
          LEFT JOIN payments p ON p.id = r.payment_id
              WHERE r.draw_id = %s
-               AND r.number  = %s
+               AND r.numbers  = %s
                AND (r.status = 'paid' OR p.status = 'approved')
              LIMIT 1
         """, (draw_id, number))
