@@ -216,16 +216,39 @@ def paid_user_for_number(conn, draw_id: int, number: int):
 
 # --------- Loto helper ---------
 def get_last_lotomania_number():
-    # espera JSON com lista de dezenas; usamos APENAS o ÚLTIMO número sorteado
+    # tenta obter a ORDEM real do sorteio; se não houver, cai para a lista simples
     r = requests.get(LOT_ENDPOINT, timeout=20, headers={"Accept": "application/json"})
     r.raise_for_status()
     j = r.json()
-    # exemplo comum: j["listaDezenas"] -> ["00".."99"]
+
+    # chaves comuns que trazem a ordem de extração
+    ordem_keys = [
+        "dezenasOrdemSorteio",
+        "listaDezenasOrdemSorteio",
+        "dezenasSorteadasOrdem",
+        "listaDezenasSorteadasOrdem",
+        "dezenasSorteadasOrdemSorteio",
+    ]
+
+    seq = None
+    for k in ordem_keys:
+        if k in j and j[k]:
+            seq = j[k]
+            break
+
+    if seq:
+        # último EXTRAÍDO (na ordem do sorteio)
+        ultimo = int(str(seq[-1]).lstrip("0") or "0")
+        print(f"[lotomania] (ordem) último número sorteado: {ultimo}")
+        return ultimo
+
+    # fallback: sem ordem explícita; usa lista simples (pode não refletir a última bolinha)
     dezenas = j.get("listaDezenas") or j.get("dezenas") or []
     if not dezenas:
         raise RuntimeError("Sem dezenas no payload da Lotomania")
-    ultimo = int(str(dezenas[-1]).lstrip("0") or "0")  # "07" -> 7
-    print(f"[lotomania] Último número sorteado: {ultimo}")
+    print("[lotomania] Aviso: API sem ordem de sorteio; usando lista simples (fallback).")
+    ultimo = int(str(dezenas[-1]).lstrip("0") or "0")
+    print(f"[lotomania] (fallback) último número sorteado: {ultimo}")
     return ultimo
 
 # --------- Main ---------
