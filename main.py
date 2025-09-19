@@ -99,6 +99,41 @@ def set_winner_and_close(conn, draw_id: int, winner_number: int, winner_user_id:
                AND status = 'open'
         """, (winner_number, winner_user_id, draw_id))
 
+def set_result_no_winner_and_close(conn, draw_id: int, winner_number: int):
+    """Fecha o sorteio registrando o número sorteado, mesmo sem vencedor pago."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE draws
+               SET status = 'closed',
+                   winner_number = %s,
+                   winner_user_id = NULL,
+                   closed_at = NOW()
+             WHERE id = %s
+               AND status = 'open'
+        """, (winner_number, draw_id))
+
+def mark_draw_as_sorteado(conn, draw_id: int):
+    """Marca o sorteio como 'sorteado' e registra realized_at (sem remover closed_at)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE draws
+               SET status = 'sorteado',
+                   realized_at = NOW()
+             WHERE id = %s
+        """, (draw_id,))
+
+def open_new_draw(conn):
+    """Abre um novo sorteio 'open'. Ajuste os campos se sua tabela exigir mais colunas."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO draws (status, opened_at)
+            VALUES ('open', NOW())
+            RETURNING id
+        """)
+        new_id = cur.fetchone()["id"]
+        print(f"[draw] novo sorteio aberto: #{new_id}")
+        return new_id
+
 def get_user_email(conn, user_id: int):
     with conn.cursor() as cur:
         cur.execute("SELECT name, email FROM users WHERE id = %s", (user_id,))
@@ -149,22 +184,29 @@ def run():
         for draw_id in draws:
             user_id = paid_user_for_number(conn, draw_id, last_number)
             if not user_id:
-                print(f"[draw {draw_id}] último número {last_number} NÃO está pago; mantém aberto.")
-                continue
-
-            # fechar sorteio
-            print(f"[draw {draw_id}] vencedor -> user {user_id}, número {last_number}")
-            set_winner_and_close(conn, draw_id, last_number, user_id)
-
-            # e-mails
-            name, email = get_user_email(conn, user_id)
-            if email:
-                send_winner_email(email, name or "Participante", draw_id, last_number)
+                print(f"[draw {draw_id}] último número {last_number} NÃO está pago; mesmo assim fecha e registra como sorteado.")
+                # fecha sem vencedor (mantendo número sorteado)
+                set_result_no_winner_and_close(conn, draw_id, last_number)
+                # aviso admin (sem vencedor)
+                send_draw_closed_admin(draw_id, last_number, None, None)
             else:
-                print(f"[email] usuário {user_id} sem e-mail; não foi possível notificar.")
+                # fechar sorteio com vencedor
+                print(f"[draw {draw_id}] vencedor -> user {user_id}, número {last_number}")
+                set_winner_and_close(conn, draw_id, last_number, user_id)
 
-            # aviso administrativo sempre que fechar
-            send_draw_closed_admin(draw_id, last_number, name, email)
+                # e-mails
+                name, email = get_user_email(conn, user_id)
+                if email:
+                    send_winner_email(email, name or "Participante", draw_id, last_number)
+                else:
+                    print(f"[email] usuário {user_id} sem e-mail; não foi possível notificar.")
+
+                # aviso administrativo sempre que fechar
+                send_draw_closed_admin(draw_id, last_number, name, email)
+
+            # Em ambos os casos: marcar como 'sorteado' + realized_at e abrir novo sorteio
+            mark_draw_as_sorteado(conn, draw_id)
+            open_new_draw(conn)
 
         if COMMIT:
             conn.commit()
