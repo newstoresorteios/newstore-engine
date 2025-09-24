@@ -35,7 +35,7 @@ jobs:
           LOTOMANIA_ENDPOINT: "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotomania"
         run: |
           # define e imprime (mascarado) a URL que SERÁ usada
-          export POSTGRES_URL="postgres://postgres.mgwvavsjxzwflibcjzhd:CtPrJ5nOpomcjuJV@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require"
+          export POSTGRES_URL="postgres://postgres.mgw    vavsjxzwflibcjzhd:CtPrJ5nOpomcjuJV@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require"
           python - <<'PY'
           import os, re
           u = os.getenv("POSTGRES_URL","")
