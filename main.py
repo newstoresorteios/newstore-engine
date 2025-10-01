@@ -4,7 +4,7 @@ from email.message import EmailMessage
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # >>> NOVO: utilidades para limpar a URL do Postgres e mascarar senha nos logs
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -53,7 +53,7 @@ def _clean_pg_url(u: str) -> str:
 # --------- E-MAIL ---------
 def _smtp_send(to_email: str, subject: str, body: str):
     if not (SMTP_USER and SMTP_PASS and to_email):
-        print("[email] SMTP config incompleta; pulando envio.")
+        print("[email] SMTP config incompleta ou destinatário vazio; pulando envio.")
         return
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -65,15 +65,18 @@ def _smtp_send(to_email: str, subject: str, body: str):
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
         s.starttls()
         s.login(SMTP_USER, SMTP_PASS)
-        s.send_message(msg)
-    print("[email] OK")
+        if COMMIT:
+            s.send_message(msg)
+            print("[email] OK (enviado)")
+        else:
+            print("[email] DRY-RUN (não enviado)")
 
-def send_winner_email(to_email: str, to_name: str, draw_id: int, winner_number: int):
-    subj = f"🎉 {APP_NAME}: Você venceu o Sorteio #{draw_id}!"
+def send_winner_email(to_email: str, to_name: str, draw_label: str, draw_id: int, winner_number: int):
+    subj = f"🎉 {APP_NAME}: Você venceu {draw_label}!"
     body = f"""Olá, {to_name or 'Participante'}!
 
-Parabéns! Você é o vencedor do Sorteio #{draw_id}.
-Número vencedor: {winner_number}
+Parabéns! Você é o vencedor de {draw_label} (#{draw_id}).
+Número vencedor: {winner_number:02d}
 
 Nossa equipe entrará em contato com as próximas instruções.
 Se você não reconhece esta mensagem, por favor, ignore.
@@ -83,15 +86,15 @@ Atenciosamente,
 """
     _smtp_send(to_email, subj, body)
 
-def send_draw_closed_admin(draw_id: int, winner_number: int, winner_name: str, winner_email: str):
+def send_draw_closed_admin(draw_label: str, draw_id: int, winner_number: int, winner_name: str, winner_email: str):
     """E-mail para o admin informando fechamento do sorteio."""
     if not ADMIN_EMAIL:
         print("[email-admin] ADMIN_EMAIL vazio; pulando.")
         return
-    subj = f"✅ {APP_NAME}: Sorteio #{draw_id} FECHADO"
-    body = f"""Sorteio #{draw_id} foi fechado.
+    subj = f"✅ {APP_NAME}: {draw_label} (#{draw_id}) SORTEADO"
+    body = f"""{draw_label} (#{draw_id}) foi realizado e marcado como SORTEADO.
 
-Número sorteado (vencedor): {winner_number}
+Número sorteado (vencedor): {winner_number:02d}
 
 Ganhador:
 - Nome:  {winner_name or '-'}
@@ -101,6 +104,21 @@ Data/Hora (UTC): {datetime.utcnow().isoformat()}Z
 """
     _smtp_send(ADMIN_EMAIL, subj, body)
 
+def send_loser_email(to_email: str, to_name: str, draw_label: str, draw_id: int, winner_number: int, winner_name: str):
+    subj = f"{APP_NAME}: Resultado de {draw_label} (#{draw_id})"
+    vencedor_txt = (winner_name or "participante") + f" com o número {winner_number:02d}"
+    body = f"""Olá, {to_name or 'Participante'}!
+
+O sorteio {draw_label} (#{draw_id}) foi realizado.
+Vencedor: {vencedor_txt}.
+
+Infelizmente você não foi contemplado, mais sorte da próxima vez!
+
+Acompanhe nossos próximos sorteios!
+{APP_NAME}
+"""
+    _smtp_send(to_email, subj, body)
+
 # --------- DB helpers ---------
 def db():
     # >>> NOVO: limpa a URL e loga (mascarado)
@@ -109,49 +127,151 @@ def db():
     # <<< NOVO
     return psycopg2.connect(pg_url, cursor_factory=RealDictCursor, sslmode="require")
 
-def get_open_draws(conn):
+def get_open_draws_with_meta(conn):
+    """
+    Retorna sorteios 'open' com id e opened_at.
+    """
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT id FROM draws
-            WHERE status = 'open'
-            ORDER BY id ASC
+            SELECT id, opened_at
+              FROM draws
+             WHERE status = 'open'
+             ORDER BY id ASC
         """)
-        return [row["id"] for row in cur.fetchall()]
+        return cur.fetchall() or []
 
-def set_winner_and_close(conn, draw_id: int, winner_number: int, winner_user_id: int):
+def get_draw_label(conn, draw_id: int) -> str:
+    """
+    Tenta obter um rótulo amigável do sorteio (title/name/label/product_name).
+    Se não existir, usa 'Sorteio #<id>'.
+    """
     with conn.cursor() as cur:
         cur.execute("""
-            UPDATE draws
-               SET status = 'closed',
-                   winner_number = %s,
-                   winner_user_id = %s,
-                   closed_at = NOW()
-             WHERE id = %s
-               AND status = 'open'
-        """, (winner_number, winner_user_id, draw_id))
+            SELECT column_name
+              FROM information_schema.columns
+             WHERE table_schema='public' AND table_name='draws'
+        """)
+        cols = {row["column_name"] for row in cur.fetchall()}
 
-def set_result_no_winner_and_close(conn, draw_id: int, winner_number: int):
-    """Fecha o sorteio registrando o número sorteado, mesmo sem vencedor pago."""
+        candidates = ["title", "name", "label", "product_name"]
+        for c in candidates:
+            if c in cols:
+                cur.execute(f"SELECT {c} FROM draws WHERE id = %s", (draw_id,))
+                row = cur.fetchone()
+                if row:
+                    val = (row.get(c) or "").strip()
+                    if val:
+                        return val
+    return f"Sorteio #{draw_id}"
+
+# --- Total de vagas (tenta descobrir por config; fallback 100: 00..99)
+def _get_total_slots_from_config(conn) -> int:
     with conn.cursor() as cur:
+        # tenta app_config
         cur.execute("""
-            UPDATE draws
-               SET status = 'closed',
-                   winner_number = %s,
-                   winner_user_id = NULL,
-                   closed_at = NOW()
-             WHERE id = %s
-               AND status = 'open'
-        """, (winner_number, draw_id))
+            SELECT key, value FROM app_config
+             WHERE key IN (
+                'total_numbers','ticket_count','max_number','range_max','ticket_total'
+             )
+        """)
+        rows = cur.fetchall() or []
+        kv = { (r["key"] or "").lower(): r["value"] for r in rows }
+        # chaves em ordem de preferência
+        for k in ("total_numbers","ticket_count","ticket_total","max_number","range_max"):
+            v = kv.get(k)
+            if v is None:
+                continue
+            try:
+                n = int(v)
+                if n > 0:
+                    return n
+            except:
+                pass
 
-def mark_draw_as_sorteado(conn, draw_id: int):
-    """Marca o sorteio como 'sorteado' e registra realized_at (sem remover closed_at)."""
+        # tenta kv_store
+        cur.execute("""
+            SELECT key, value FROM kv_store
+             WHERE key IN (
+                'total_numbers','ticket_count','ticket_total','max_number','range_max'
+             )
+        """)
+        rows = cur.fetchall() or []
+        kv = { (r["key"] or "").lower(): r["value"] for r in rows }
+        for k in ("total_numbers","ticket_count","ticket_total","max_number","range_max"):
+            v = kv.get(k)
+            if v is None:
+                continue
+            try:
+                n = int(v)
+                if n > 0:
+                    return n
+            except:
+                pass
+
+    return 100  # fallback padrão: 00..99
+
+def get_sold_count(conn, draw_id: int) -> int:
+    """
+    Conta quantos números estão efetivamente 'vendidos' (reservations paid OU payment approved/paid).
+    Suporta schema com 'number' (int) ou 'numbers' (int[]).
+    """
+    with conn.cursor() as cur:
+        # Descobre as colunas disponíveis em reservations
+        cur.execute("""
+            SELECT column_name, data_type
+              FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND table_name   = 'reservations'
+        """)
+        cols = {row["column_name"]: row["data_type"] for row in cur.fetchall()}
+
+        if "number" in cols:
+            query = """
+                SELECT COUNT(DISTINCT r.number) AS sold
+                  FROM reservations r
+             LEFT JOIN payments p ON p.id = r.payment_id
+                 WHERE r.draw_id = %s
+                   AND (r.status = 'paid' OR p.status IN ('approved','paid'))
+            """
+            params = (draw_id,)
+        elif "numbers" in cols:
+            # unnests numbers[] para contar distintos
+            query = """
+                WITH flat AS (
+                    SELECT UNNEST(r.numbers) AS num
+                      FROM reservations r
+                 LEFT JOIN payments p ON p.id = r.payment_id
+                     WHERE r.draw_id = %s
+                       AND (r.status = 'paid' OR p.status IN ('approved','paid'))
+                )
+                SELECT COUNT(DISTINCT num) AS sold FROM flat
+            """
+            params = (draw_id,)
+        else:
+            raise RuntimeError("Tabela reservations não possui colunas 'number' nem 'numbers'.")
+
+        cur.execute(query, params)
+        row = cur.fetchone()
+        return int(row["sold"] or 0)
+
+def set_draw_sorteado(conn, draw_id: int, winner_number: int, winner_user_id):
+    """
+    Marca o sorteio como SORTEADO (encerra + realiza):
+    - status='sorteado'
+    - winner_number, winner_user_id (pode ser NULL)
+    - closed_at=NOW(), realized_at=NOW()
+    """
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE draws
                SET status = 'sorteado',
+                   winner_number = %s,
+                   winner_user_id = %s,
+                   closed_at = NOW(),
                    realized_at = NOW()
              WHERE id = %s
-        """, (draw_id,))
+               AND status = 'open'
+        """, (winner_number, winner_user_id, draw_id))
 
 def open_new_draw(conn):
     """Abre um novo sorteio 'open'. Ajuste os campos se sua tabela exigir mais colunas."""
@@ -184,26 +304,24 @@ def paid_user_for_number(conn, draw_id: int, number: int):
         cols = {row["column_name"]: row["data_type"] for row in cur.fetchall()}
 
         if "number" in cols:
-            # Coluna única 'number' (int)
             query = """
                 SELECT r.user_id
                   FROM reservations r
              LEFT JOIN payments p ON p.id = r.payment_id
                  WHERE r.draw_id = %s
                    AND r.number  = %s
-                   AND (r.status = 'paid' OR p.status = 'approved')
+                   AND (r.status = 'paid' OR p.status IN ('approved','paid'))
                  LIMIT 1
             """
             params = (draw_id, number)
         elif "numbers" in cols:
-            # Coluna 'numbers' (int[]) -> checar se o inteiro está contido no array
             query = """
                 SELECT r.user_id
                   FROM reservations r
              LEFT JOIN payments p ON p.id = r.payment_id
                  WHERE r.draw_id = %s
                    AND ( %s = ANY(r.numbers) OR r.numbers @> ARRAY[%s]::int[] )
-                   AND (r.status = 'paid' OR p.status = 'approved')
+                   AND (r.status = 'paid' OR p.status IN ('approved','paid'))
                  LIMIT 1
             """
             params = (draw_id, number, number)
@@ -214,41 +332,38 @@ def paid_user_for_number(conn, draw_id: int, number: int):
         r = cur.fetchone()
         return r["user_id"] if r else None
 
+def get_participants(conn, draw_id: int):
+    """
+    Participantes com participação válida (reservations paid OU payments approved/paid).
+    Retorna lista de dicts {id, name, email}.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            WITH elig AS (
+                SELECT DISTINCT u.id, u.name, u.email
+                  FROM users u
+                  JOIN reservations r ON r.user_id = u.id
+             LEFT JOIN payments p ON p.id = r.payment_id
+                 WHERE r.draw_id = %s
+                   AND (r.status = 'paid' OR p.status IN ('approved','paid'))
+            )
+            SELECT id, name, email
+              FROM elig
+             WHERE COALESCE(NULLIF(email,''), '') <> ''
+        """, (draw_id,))
+        return cur.fetchall() or []
+
 # --------- Loto helper ---------
 def get_last_lotomania_number():
-    # tenta obter a ORDEM real do sorteio; se não houver, cai para a lista simples
+    # espera JSON com lista de dezenas; usamos APENAS o ÚLTIMO número sorteado
     r = requests.get(LOT_ENDPOINT, timeout=20, headers={"Accept": "application/json"})
     r.raise_for_status()
     j = r.json()
-
-    # chaves comuns que trazem a ordem de extração
-    ordem_keys = [
-        "dezenasOrdemSorteio",
-        "listaDezenasOrdemSorteio",
-        "dezenasSorteadasOrdem",
-        "listaDezenasSorteadasOrdem",
-        "dezenasSorteadasOrdemSorteio",
-    ]
-
-    seq = None
-    for k in ordem_keys:
-        if k in j and j[k]:
-            seq = j[k]
-            break
-
-    if seq:
-        # último EXTRAÍDO (na ordem do sorteio)
-        ultimo = int(str(seq[-1]).lstrip("0") or "0")
-        print(f"[lotomania] (ordem) último número sorteado: {ultimo}")
-        return ultimo
-
-    # fallback: sem ordem explícita; usa lista simples (pode não refletir a última bolinha)
     dezenas = j.get("listaDezenas") or j.get("dezenas") or []
     if not dezenas:
         raise RuntimeError("Sem dezenas no payload da Lotomania")
-    print("[lotomania] Aviso: API sem ordem de sorteio; usando lista simples (fallback).")
-    ultimo = int(str(dezenas[-1]).lstrip("0") or "0")
-    print(f"[lotomania] (fallback) último número sorteado: {ultimo}")
+    ultimo = int(str(dezenas[-1]).lstrip("0") or "0")  # "07" -> 7
+    print(f"[lotomania] Último número sorteado: {ultimo}")
     return ultimo
 
 # --------- Main ---------
@@ -256,38 +371,74 @@ def run():
     print("[run] iniciando", datetime.now(timezone.utc).isoformat())
     conn = db()
     try:
-        draws = get_open_draws(conn)
-        print(f"[run] sorteios abertos: {draws}")
-        if not draws:
+        opens = get_open_draws_with_meta(conn)
+        print(f"[run] sorteios abertos: {[d['id'] for d in opens]}")
+        if not opens:
             return 0
+
+        total_slots = _get_total_slots_from_config(conn)
+        print(f"[run] total_slots (capacidade): {total_slots}")
 
         last_number = get_last_lotomania_number()
 
-        for draw_id in draws:
-            user_id = paid_user_for_number(conn, draw_id, last_number)
-            if not user_id:
-                print(f"[draw {draw_id}] último número {last_number} NÃO está pago; mesmo assim fecha e registra como sorteado.")
-                # fecha sem vencedor (mantendo número sorteado)
-                set_result_no_winner_and_close(conn, draw_id, last_number)
-                # aviso admin (sem vencedor)
-                send_draw_closed_admin(draw_id, last_number, None, None)
-            else:
-                # fechar sorteio com vencedor
-                print(f"[draw {draw_id}] vencedor -> user {user_id}, número {last_number}")
-                set_winner_and_close(conn, draw_id, last_number, user_id)
+        for d in opens:
+            draw_id = d["id"]
+            draw_label = get_draw_label(conn, draw_id)
+            opened_at = d.get("opened_at")
+            age_days = None
+            if opened_at:
+                # opened_at já vem com tz? assume naive->utc igual
+                age_days = (datetime.now(timezone.utc) - opened_at.replace(tzinfo=timezone.utc)).days
+            print(f"[draw {draw_id}] label='{draw_label}' age_days={age_days}")
 
-                # e-mails
-                name, email = get_user_email(conn, user_id)
-                if email:
-                    send_winner_email(email, name or "Participante", draw_id, last_number)
-                else:
-                    print(f"[email] usuário {user_id} sem e-mail; não foi possível notificar.")
+            sold = get_sold_count(conn, draw_id)
+            sold_out = sold >= total_slots
+            print(f"[draw {draw_id}] vendidos={sold} / {total_slots} -> sold_out={sold_out}")
 
-                # aviso administrativo sempre que fechar
-                send_draw_closed_admin(draw_id, last_number, name, email)
+            # --- Regra pedida:
+            # - Se NÃO vendeu todos os números: NÃO fecha, a menos que tenha >=7 dias aberto.
+            # - Se vendeu todos os números: pode fechar imediatamente.
+            can_close = sold_out or (age_days is not None and age_days >= 7)
+            if not can_close:
+                print(f"[draw {draw_id}] NÃO será fechado (ainda não vendeu tudo e não completou 7 dias).")
+                continue
 
-            # Em ambos os casos: marcar como 'sorteado' + realized_at e abrir novo sorteio
-            mark_draw_as_sorteado(conn, draw_id)
+            # Determina vencedor pelo último número da Lotomania
+            winner_user_id = paid_user_for_number(conn, draw_id, last_number)
+
+            # Dados do vencedor (se houver)
+            winner_name, winner_email = (None, None)
+            if winner_user_id:
+                winner_name, winner_email = get_user_email(conn, winner_user_id)
+
+            # Marca sorteado (fecha + realized_at)
+            set_draw_sorteado(conn, draw_id, last_number, winner_user_id)
+
+            # E-mail para vencedor (se houver)
+            if winner_user_id and winner_email:
+                send_winner_email(winner_email, winner_name or "Participante", draw_label, draw_id, last_number)
+            elif winner_user_id and not winner_email:
+                print(f"[email] usuário {winner_user_id} sem e-mail; não foi possível notificar vencedor.")
+
+            # Admin sempre recebe (com nome/numero do vencedor quando houver)
+            send_draw_closed_admin(draw_label, draw_id, last_number, winner_name, winner_email)
+
+            # Participantes não contemplados (com info do vencedor)
+            parts = get_participants(conn, draw_id)
+            loser_list = [p for p in parts if p["id"] != (winner_user_id or -1)]
+            print(f"[draw {draw_id}] enviando e-mail de 'não contemplado' para {len(loser_list)} participantes")
+            for p in loser_list:
+                if p.get("email"):
+                    send_loser_email(
+                        p["email"],
+                        p.get("name") or "Participante",
+                        draw_label,
+                        draw_id,
+                        last_number,
+                        winner_name or "-"
+                    )
+
+            # Opcional: abrir um novo sorteio
             open_new_draw(conn)
 
         if COMMIT:
@@ -300,7 +451,10 @@ def run():
         return 0
     except Exception as e:
         print("[run] erro:", repr(e))
-        conn.rollback()
+        try:
+            conn.rollback()
+        except:
+            pass
         return 1
     finally:
         conn.close()
