@@ -11,24 +11,33 @@ from datetime import datetime, timezone
 # ---- ENV ----
 DB_URL = os.getenv("POSTGRES_URL", "")
 
-# SMTP (Brevo/Outro)
+# SMTP
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp-relay.brevo.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
-SMTP_FROM = os.getenv("SMTP_FROM", "no-reply@newstorerj.com.br")
+SMTP_FROM = os.getenv("SMTP_FROM", "contato@newstorerj.com.br")
+SMTP_NAME = os.getenv("SMTP_NAME", "NewStore Sorteios")
 
-# Para fallback (se não houver participantes elegíveis)
+# Sandbox opcional: redireciona todos os envios para um único endereço
+EMAIL_SANDBOX_TO = os.getenv("EMAIL_SANDBOX_TO", "")
+
+# Fallback (se não houver participantes elegíveis)
 NOTIFY_FALLBACK_TO = os.getenv("NOTIFY_FALLBACK_TO", "")
 
-# Link do stream da Caixa (pedido do Paulo)
+# Link do stream da Caixa
 YOUTUBE_STREAMS_URL = os.getenv(
     "YOUTUBE_STREAMS_URL",
     "https://www.youtube.com/@canalcaixa/streams",
 )
 
-# Modo dry-run por padrão (só loga). Use COMMIT=true para enviar de fato.
+# Modo commit/dry-run
 COMMIT = os.getenv("COMMIT", "false").lower() in ("1", "true", "yes")
+DRY_RUN = not COMMIT
+
+# Fuse anti-acidente (opcional)
+ENVIRONMENT = os.getenv("ENVIRONMENT", "production").lower()
+ALLOW_PROD_DRYRUN = os.getenv("ALLOW_PROD_DRYRUN", "").lower() in ("1", "true", "yes")
 
 
 def log(*a):
@@ -39,6 +48,8 @@ def db_connect():
     if not DB_URL:
         raise RuntimeError("POSTGRES_URL não configurada")
     conn = psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
+    # leitura apenas (por segurança)
+    conn.set_session(readonly=True, autocommit=False)
     return conn
 
 
@@ -59,10 +70,8 @@ def get_open_draw(conn):
 
 def get_recipients_for_open_draw(conn, draw_id):
     """
-    Estratégia:
-    - Enviar para usuários que têm participação válida no sorteio aberto.
-    - Considera quem tem números 'paid' em reservations OU pagamentos 'approved'/'paid' na payments.
-    - Evita duplicidade via DISTINCT.
+    Envia para quem tem participação válida:
+    - reservations.status = 'paid' OU payments.status IN ('approved','paid')
     """
     with conn.cursor() as cur:
         cur.execute(
@@ -109,17 +118,23 @@ def send_email(to_addrs, subject, body):
     if not to_addrs:
         return
 
+    # Dry-run: bloqueia absolutamente
+    if DRY_RUN:
+        log("DRY-RUN: envio BLOQUEADO ->", {"to": to_addrs, "subject": subject})
+        return
+
+    # Sandbox: redireciona todos para um único destinatário
+    if EMAIL_SANDBOX_TO:
+        log("SANDBOX ativo: redirecionando todos os envios para", EMAIL_SANDBOX_TO)
+        to_addrs = [EMAIL_SANDBOX_TO]
+
     msg = EmailMessage()
-    msg["From"] = SMTP_FROM
+    msg["From"] = f"{SMTP_NAME} <{SMTP_FROM}>"
     msg["To"] = ", ".join(to_addrs)
     msg["Subject"] = subject
     msg.set_content(body)
 
-    if not COMMIT:
-        log("DRY-RUN: (não enviando e-mail) ->", {"to": to_addrs, "subject": subject})
-        return
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
         s.starttls()
         if SMTP_USER and SMTP_PASS:
             s.login(SMTP_USER, SMTP_PASS)
@@ -129,12 +144,17 @@ def send_email(to_addrs, subject, body):
 
 def main():
     log("IN", {"at": datetime.now(timezone.utc).isoformat(), "commit": COMMIT})
+
+    # Fuse: impede dry-run em produção sem permissão explícita
+    if ENVIRONMENT == "production" and DRY_RUN and not ALLOW_PROD_DRYRUN:
+        log("FUSE: abortado (COMMIT=false em produção sem ALLOW_PROD_DRYRUN=1)")
+        return
+
     conn = db_connect()
     try:
         open_draw = get_open_draw(conn)
         if not open_draw:
             log("Não há sorteio com status 'open'. Nada a notificar.")
-            # Fallback opcional para avisar time interno que não há sorteio aberto
             if NOTIFY_FALLBACK_TO:
                 subj = "[NewStore] Aviso 20:00 – não há sorteio 'open' hoje"
                 body = (
@@ -149,7 +169,6 @@ def main():
         emails = sorted({r["email"] for r in recipients if r.get("email")})
 
         if not emails and NOTIFY_FALLBACK_TO:
-            # Se não houver participantes elegíveis, manda pelo menos para o fallback (time interno)
             emails = [NOTIFY_FALLBACK_TO]
 
         if not emails:
