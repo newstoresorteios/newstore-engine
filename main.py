@@ -164,51 +164,48 @@ def get_draw_label(conn, draw_id: int) -> str:
                         return val
     return f"Sorteio #{draw_id}"
 
-# --- Total de vagas (tenta descobrir por config; fallback 100: 00..99)
+# --- Total de vagas (lê app_config key/value e kv_store k/v; fallback 100)
 def _get_total_slots_from_config(conn) -> int:
-    with conn.cursor() as cur:
-        # tenta app_config
-        cur.execute("""
-            SELECT key, value FROM app_config
-             WHERE key IN (
-                'total_numbers','ticket_count','max_number','range_max','ticket_total'
-             )
-        """)
+    def _load_app_config(cur):
+        cur.execute("SELECT key, value FROM app_config")
         rows = cur.fetchall() or []
-        kv = { (r["key"] or "").lower(): r["value"] for r in rows }
-        # chaves em ordem de preferência
+        return { (str(r["key"] or "").strip().lower()): r["value"] for r in rows }
+
+    def _load_kv_store(cur):
+        # kv_store tem colunas k/v (conforme seu schema)
+        cur.execute("SELECT k, v FROM kv_store")
+        rows = cur.fetchall() or []
+        return { (str(r["k"] or "").strip().lower()): r["v"] for r in rows }
+
+    try:
+        with conn.cursor() as cur:
+            kv = {}
+            try:
+                kv.update(_load_app_config(cur))
+            except Exception as e:
+                print("[config] app_config não lida:", repr(e))
+            try:
+                kv.update(_load_kv_store(cur))
+            except Exception as e:
+                print("[config] kv_store não lida:", repr(e))
+
         for k in ("total_numbers","ticket_count","ticket_total","max_number","range_max"):
             v = kv.get(k)
             if v is None:
                 continue
             try:
-                n = int(v)
+                n = int(str(v))
                 if n > 0:
+                    print(f"[config] {k}={n}")
                     return n
-            except:
+            except Exception:
                 pass
 
-        # tenta kv_store
-        cur.execute("""
-            SELECT key, value FROM kv_store
-             WHERE key IN (
-                'total_numbers','ticket_count','ticket_total','max_number','range_max'
-             )
-        """)
-        rows = cur.fetchall() or []
-        kv = { (r["key"] or "").lower(): r["value"] for r in rows }
-        for k in ("total_numbers","ticket_count","ticket_total","max_number","range_max"):
-            v = kv.get(k)
-            if v is None:
-                continue
-            try:
-                n = int(v)
-                if n > 0:
-                    return n
-            except:
-                pass
-
-    return 100  # fallback padrão: 00..99
+        print("[config] nenhuma chave numérica válida encontrada; usando fallback 100")
+        return 100
+    except Exception as e:
+        print("[config] erro ao ler configs:", repr(e), "-> usando fallback 100")
+        return 100
 
 def get_sold_count(conn, draw_id: int) -> int:
     """
