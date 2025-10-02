@@ -73,7 +73,7 @@ on:
       - name: Run main.py (resultado 21:15 BRT)
         env:
           # ---- VARIÁVEIS COM VALORES PREENCHIDOS ----
-          POSTGRES_URL: "postgres://postgres.mgwvavsjxzwflibcjzhd:CtPrJ5nOpomcjuJV@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require&supa=base-pooler.x"
+         # POSTGRES_URL: "postgres://postgres.mgwvavsjxzwflibcjzhd:CtPrJ5nOpomcjuJV@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require&supa=base-pooler.x"
           SMTP_HOST: "smtp-relay.brevo.com"
           SMTP_PORT: "587"
           SMTP_USER: "9712be001@smtp-brevo.com"
@@ -84,5 +84,5 @@ on:
           SMTP_NAME: "NewStore Sorteios"
           APP_NAME: "NewStore Sorteios"
           ADMIN_EMAIL: "newrecreio@gmail.com"
-          LOTOMANIA_ENDPOINT: "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotomania"
+          #: "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotomania"
         run: python main.py
