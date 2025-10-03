@@ -2,11 +2,14 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
 import smtplib
 from email.message import EmailMessage
+from datetime import datetime, timezone
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from datetime import datetime, timezone
 
 # ---- ENV ----
 DB_URL = os.getenv("POSTGRES_URL", "")
@@ -44,11 +47,40 @@ def log(*a):
     print("[notify_start]", *a)
 
 
+# --- utils p/ mascarar e limpar URL do Postgres (compatível com psycopg2) ---
+
+def _mask_pg_url(u: str) -> str:
+    """Mascara a senha ao imprimir a URL no log."""
+    return re.sub(r'://([^:]+):[^@]+@', r'://\1:***@', u or "")
+
+def _clean_pg_url(u: str) -> str:
+    """
+    Remove parâmetros não suportados (ex.: 'supa') e mantém apenas chaves aceitas
+    pelo libpq/psycopg2. Preserva sslmode e afins.
+    """
+    if not u:
+        return u
+    parts = urlsplit(u)
+    q = dict(parse_qsl(parts.query or "", keep_blank_values=True))
+    allowed = {
+        "sslmode", "ssl", "sslrootcert", "connect_timeout",
+        "target_session_attrs", "application_name", "options"
+    }
+    q = {k: v for k, v in q.items() if k in allowed}
+    new_query = urlencode(q)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+
+# --------------------------- DB ---------------------------------
+
 def db_connect():
     if not DB_URL:
         raise RuntimeError("POSTGRES_URL não configurada")
-    conn = psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
-    # leitura apenas (por segurança)
+    pg_url = _clean_pg_url(DB_URL)
+    print("[notify_start] usando POSTGRES_URL:", _mask_pg_url(pg_url))
+    # força TLS e usa cursor dict
+    conn = psycopg2.connect(pg_url, cursor_factory=RealDictCursor, sslmode="require")
+    # leitura apenas, por segurança
     conn.set_session(readonly=True, autocommit=False)
     return conn
 
@@ -64,8 +96,7 @@ def get_open_draw(conn):
              limit 1
             """
         )
-        row = cur.fetchone()
-        return row
+        return cur.fetchone()
 
 
 def get_recipients_for_open_draw(conn, draw_id):
@@ -95,24 +126,10 @@ def get_recipients_for_open_draw(conn, draw_id):
             """,
             (draw_id, draw_id),
         )
-        rows = cur.fetchall() or []
-        return rows
+        return cur.fetchall() or []
 
 
-def build_email_subject(draw_id):
-    return f"[NewStore] Sorteio começa às 20:00 – Assista ao vivo (Sorteio #{draw_id})"
-
-
-def build_email_body(draw_id):
-    return (
-        f"Olá!\n\n"
-        f"O sorteio #{draw_id} começa hoje às 20:00.\n"
-        f"Acompanhe ao vivo no canal da Caixa:\n\n"
-        f"{YOUTUBE_STREAMS_URL}\n\n"
-        f"Boa sorte! 🍀\n"
-        f"— Equipe NewStore\n"
-    )
-
+# -------------------------- EMAIL --------------------------------
 
 def send_email(to_addrs, subject, body):
     if not to_addrs:
@@ -141,6 +158,23 @@ def send_email(to_addrs, subject, body):
         s.send_message(msg)
         log("E-mail enviado para", to_addrs)
 
+
+def build_email_subject(draw_id):
+    return f"[NewStore] Sorteio começa às 20:00 – Assista ao vivo (Sorteio #{draw_id})"
+
+
+def build_email_body(draw_id):
+    return (
+        f"Olá!\n\n"
+        f"O sorteio #{draw_id} começa hoje às 20:00.\n"
+        f"Acompanhe ao vivo no canal da Caixa:\n\n"
+        f"{YOUTUBE_STREAMS_URL}\n\n"
+        f"Boa sorte! 🍀\n"
+        f"— Equipe NewStore\n"
+    )
+
+
+# --------------------------- MAIN --------------------------------
 
 def main():
     log("IN", {"at": datetime.now(timezone.utc).isoformat(), "commit": COMMIT})
