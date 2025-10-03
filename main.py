@@ -6,10 +6,10 @@ from psycopg2.extras import RealDictCursor
 import requests
 from datetime import datetime, timezone, timedelta
 
-# >>> NOVO: utilidades para limpar a URL do Postgres e mascarar senha nos logs
+# >>> utilidades para limpar a URL do Postgres e mascarar senha nos logs
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import re
-# <<< NOVO
+# <<<
 
 # --------- ENV ---------
 DB_URL = os.getenv("POSTGRES_URL", "")
@@ -28,7 +28,7 @@ APP_NAME  = os.getenv("APP_NAME",  "NewStore Sorteios")
 # Aviso administrativo quando fechar sorteio
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "newrecreio@gmail.com")
 
-# --------- helpers NOVOS (PG URL) ---------
+# --------- helpers (PG URL) ---------
 def _mask_pg_url(u: str) -> str:
     """Mascara a senha ao imprimir a URL no log."""
     return re.sub(r'://([^:]+):[^@]+@', r'://\1:***@', u or "")
@@ -121,16 +121,29 @@ Acompanhe nossos próximos sorteios!
 
 # --------- DB helpers ---------
 def db():
-    # >>> NOVO: limpa a URL e loga (mascarado)
+    # limpa a URL e loga (mascarado)
     pg_url = _clean_pg_url(DB_URL)
     print("[db] usando POSTGRES_URL:", _mask_pg_url(pg_url))
-    # <<< NOVO
     return psycopg2.connect(pg_url, cursor_factory=RealDictCursor, sslmode="require")
 
+def get_pending_draws(conn):
+    """
+    Retorna:
+      - todos os 'open' (podem ou não fechar agora);
+      - e os 'closed' com realized_at IS NULL (precisam ser finalizados e comunicados).
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, status, opened_at
+              FROM draws
+             WHERE status IN ('open','closed')
+               AND (status = 'open' OR realized_at IS NULL)
+             ORDER BY id ASC
+        """)
+        return cur.fetchall() or []
+
 def get_open_draws_with_meta(conn):
-    """
-    Retorna sorteios 'open' com id e opened_at.
-    """
+    """(mantido para compat, não usado)"""
     with conn.cursor() as cur:
         cur.execute("""
             SELECT id, opened_at
@@ -253,7 +266,7 @@ def get_sold_count(conn, draw_id: int) -> int:
 
 def set_draw_sorteado(conn, draw_id: int, winner_number: int, winner_user_id):
     """
-    Marca o sorteio como SORTEADO (encerra + realiza):
+    Marca o sorteio como SORTEADO (encerra + realiza) apenas quando estava 'open':
     - status='sorteado'
     - winner_number, winner_user_id (pode ser NULL)
     - closed_at=NOW(), realized_at=NOW()
@@ -268,6 +281,25 @@ def set_draw_sorteado(conn, draw_id: int, winner_number: int, winner_user_id):
                    realized_at = NOW()
              WHERE id = %s
                AND status = 'open'
+        """, (winner_number, winner_user_id, draw_id))
+
+def set_draw_sorteado_any_status(conn, draw_id: int, winner_number: int, winner_user_id):
+    """
+    Finaliza independente do status atual (open/closed):
+      - status='sorteado'
+      - winner_number / winner_user_id
+      - closed_at = COALESCE(closed_at, NOW())
+      - realized_at = NOW()
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE draws
+               SET status = 'sorteado',
+                   winner_number = %s,
+                   winner_user_id = %s,
+                   closed_at = COALESCE(closed_at, NOW()),
+                   realized_at = NOW()
+             WHERE id = %s
         """, (winner_number, winner_user_id, draw_id))
 
 def open_new_draw(conn):
@@ -368,9 +400,9 @@ def run():
     print("[run] iniciando", datetime.now(timezone.utc).isoformat())
     conn = db()
     try:
-        opens = get_open_draws_with_meta(conn)
-        print(f"[run] sorteios abertos: {[d['id'] for d in opens]}")
-        if not opens:
+        draws = get_pending_draws(conn)
+        print(f"[run] sorteios pendentes: {[{'id': d['id'], 'status': d['status']} for d in draws]}")
+        if not draws:
             return 0
 
         total_slots = _get_total_slots_from_config(conn)
@@ -378,26 +410,36 @@ def run():
 
         last_number = get_last_lotomania_number()
 
-        for d in opens:
+        for d in draws:
             draw_id = d["id"]
+            status = d["status"]
             draw_label = get_draw_label(conn, draw_id)
             opened_at = d.get("opened_at")
             age_days = None
             if opened_at:
                 # opened_at já vem com tz? assume naive->utc igual
                 age_days = (datetime.now(timezone.utc) - opened_at.replace(tzinfo=timezone.utc)).days
-            print(f"[draw {draw_id}] label='{draw_label}' age_days={age_days}")
+            print(f"[draw {draw_id}] status={status} label='{draw_label}' age_days={age_days}")
 
-            sold = get_sold_count(conn, draw_id)
-            sold_out = sold >= total_slots
-            print(f"[draw {draw_id}] vendidos={sold} / {total_slots} -> sold_out={sold_out}")
+            finalize_now = False
+            open_will_be_finalized = False
 
-            # --- Regra pedida:
-            # - Se NÃO vendeu todos os números: NÃO fecha, a menos que tenha >=7 dias aberto.
-            # - Se vendeu todos os números: pode fechar imediatamente.
-            can_close = sold_out or (age_days is not None and age_days >= 7)
-            if not can_close:
-                print(f"[draw {draw_id}] NÃO será fechado (ainda não vendeu tudo e não completou 7 dias).")
+            if status == "closed":
+                # Já fechado, mas sem realized_at: finalize e comunique agora
+                finalize_now = True
+            else:
+                sold = get_sold_count(conn, draw_id)
+                sold_out = sold >= total_slots
+                print(f"[draw {draw_id}] vendidos={sold} / {total_slots} -> sold_out={sold_out}")
+
+                # Regra:
+                # - NÃO fecha se não vendeu tudo e < 7 dias
+                # - Fecha se sold_out OU >= 7 dias
+                finalize_now = sold_out or (age_days is not None and age_days >= 7)
+                open_will_be_finalized = finalize_now
+
+            if not finalize_now:
+                print(f"[draw {draw_id}] NÃO será finalizado agora.")
                 continue
 
             # Determina vencedor pelo último número da Lotomania
@@ -408,8 +450,8 @@ def run():
             if winner_user_id:
                 winner_name, winner_email = get_user_email(conn, winner_user_id)
 
-            # Marca sorteado (fecha + realized_at)
-            set_draw_sorteado(conn, draw_id, last_number, winner_user_id)
+            # Marca sorteado (funciona para open/closed)
+            set_draw_sorteado_any_status(conn, draw_id, last_number, winner_user_id)
 
             # E-mail para vencedor (se houver)
             if winner_user_id and winner_email:
@@ -435,8 +477,9 @@ def run():
                         winner_name or "-"
                     )
 
-            # Opcional: abrir um novo sorteio
-            open_new_draw(conn)
+            # Abre novo sorteio apenas quando finalizamos um 'open' agora
+            if open_will_be_finalized:
+                open_new_draw(conn)
 
         if COMMIT:
             conn.commit()
