@@ -283,11 +283,11 @@ def set_draw_sorteado(conn, draw_id: int, winner_number: int, winner_user_id):
                AND status = 'open'
         """, (winner_number, winner_user_id, draw_id))
 
-def set_draw_sorteado_any_status(conn, draw_id: int, winner_number: int, winner_user_id):
+def set_draw_sorteado_any_status(conn, draw_id: int, winner_number: int, winner_user_id, winner_name):
     """
     Finaliza independente do status atual (open/closed):
       - status='sorteado'
-      - winner_number / winner_user_id
+      - winner_number / winner_user_id / winner_name
       - closed_at = COALESCE(closed_at, NOW())
       - realized_at = NOW()
     """
@@ -297,10 +297,11 @@ def set_draw_sorteado_any_status(conn, draw_id: int, winner_number: int, winner_
                SET status = 'sorteado',
                    winner_number = %s,
                    winner_user_id = %s,
+                   winner_name   = %s,
                    closed_at = COALESCE(closed_at, NOW()),
                    realized_at = NOW()
              WHERE id = %s
-        """, (winner_number, winner_user_id, draw_id))
+        """, (winner_number, winner_user_id, winner_name, draw_id))
 
 def open_new_draw(conn):
     """Abre um novo sorteio 'open'. Ajuste os campos se sua tabela exigir mais colunas."""
@@ -450,8 +451,8 @@ def run():
             if winner_user_id:
                 winner_name, winner_email = get_user_email(conn, winner_user_id)
 
-            # Marca sorteado (funciona para open/closed)
-            set_draw_sorteado_any_status(conn, draw_id, last_number, winner_user_id)
+            # Marca sorteado (funciona para open/closed) — agora persiste também winner_name
+            set_draw_sorteado_any_status(conn, draw_id, last_number, winner_user_id, winner_name)
 
             # E-mail para vencedor (se houver)
             if winner_user_id and winner_email:
