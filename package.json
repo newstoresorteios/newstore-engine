@@ -1,0 +1,8 @@
+{
+  "name": "newstore-engine",
+  "private": true,
+  "scripts": {
+    "push:watcher": "node src/jobs/pushNotificationWatcher.js",
+    "push:test-dry-run": "node src/scripts/testPushSingleDeviceDryRun.js"
+  }
+}
