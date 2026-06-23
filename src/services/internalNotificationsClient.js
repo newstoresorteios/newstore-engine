@@ -6,20 +6,13 @@ function hasOwn(object, key) {
   return Object.prototype.hasOwnProperty.call(object, key);
 }
 
-function notificationLogData(payload) {
-  return {
-    event_key: payload.event_key || null,
-    dedupe_key: payload.dedupe_key || null,
-    category: payload.category || null,
-    entity_type: payload.entity_type || null,
-    entity_id: payload.entity_id || null,
-    has_user_id: Boolean(payload.user_id),
-    has_subscription_id: Boolean(payload.subscription_id),
-    audience_type: payload.audience?.type || null,
-  };
-}
+function blocked(reason, eventPayload) {
+  console.warn("[push-watcher] notify:blocked", {
+    event_key: eventPayload?.event_key || null,
+    dedupe_key: eventPayload?.dedupe_key || null,
+    reason,
+  });
 
-function blocked(reason) {
   return {
     ok: false,
     blocked: true,
@@ -27,10 +20,20 @@ function blocked(reason) {
   };
 }
 
+function resolveEffectiveDryRun(eventPayload) {
+  if (process.env.ENGINE_PUSH_WATCHER_DRY_RUN === "true") {
+    return true;
+  }
+
+  return eventPayload.dry_run === true;
+}
+
 async function notifyBackendEvent(payload) {
-  const eventPayload = payload && typeof payload === "object" ? payload : {};
+  const eventPayload = payload && typeof payload === "object" ? { ...payload } : {};
+  const effectiveDryRun = resolveEffectiveDryRun(eventPayload);
 
   if (process.env.ENGINE_PUSH_WATCHER_ENABLED !== "true") {
+    console.log("[push-watcher] disabled");
     return {
       ok: true,
       skipped: true,
@@ -38,20 +41,45 @@ async function notifyBackendEvent(payload) {
     };
   }
 
-  if (process.env.PUSH_WATCHER_DRY_RUN === "true") {
-    console.log("[push-watcher] dry-run", notificationLogData(eventPayload));
-    return {
-      ok: true,
-      dry_run: true,
-    };
+  const backendBaseUrl = String(
+    process.env.BACKEND_INTERNAL_BASE_URL || "",
+  ).trim();
+  const internalEngineToken = String(
+    process.env.INTERNAL_ENGINE_TOKEN || "",
+  ).trim();
+
+  if (!backendBaseUrl || !internalEngineToken) {
+    console.error("[push-watcher] backend config missing", {
+      has_base_url: Boolean(backendBaseUrl),
+      has_token: Boolean(internalEngineToken),
+    });
+    return blocked("backend_internal_config_missing", eventPayload);
   }
 
-  if (process.env.PUSH_WATCHER_ALLOW_REAL_SEND !== "true") {
-    return blocked("push_watcher_real_send_blocked");
+  if (
+    hasOwn(eventPayload, "audience") &&
+    process.env.ENGINE_PUSH_ALLOW_PRODUCTION_AUDIENCE !== "true"
+  ) {
+    return blocked("engine_audience_blocked", eventPayload);
   }
 
-  if (hasOwn(eventPayload, "audience")) {
-    return blocked("audience_blocked_in_engine_test_mode");
+  if (hasOwn(eventPayload, "user_id")) {
+    if (process.env.ENGINE_PUSH_ALLOW_SINGLE_TEST_SEND !== "true") {
+      if (!effectiveDryRun) {
+        return blocked("engine_single_send_blocked", eventPayload);
+      }
+    } else if (!effectiveDryRun) {
+      const testUserId = Number(process.env.ENGINE_PUSH_TEST_USER_ID);
+      const requestedUserId = Number(eventPayload.user_id);
+
+      if (
+        !Number.isFinite(testUserId) ||
+        !Number.isFinite(requestedUserId) ||
+        requestedUserId !== testUserId
+      ) {
+        return blocked("engine_single_send_blocked", eventPayload);
+      }
+    }
   }
 
   const channels = Array.isArray(eventPayload.channels)
@@ -63,47 +91,28 @@ async function notifyBackendEvent(payload) {
       (channel) => String(channel || "").trim().toLowerCase() === "whatsapp",
     )
   ) {
-    return blocked("whatsapp_blocked_in_engine_test_mode");
+    return blocked("whatsapp_blocked_in_engine", eventPayload);
   }
 
-  if (
-    String(eventPayload.provider || "").trim().toLowerCase() === "brevo"
-  ) {
-    return blocked("brevo_blocked_in_engine_test_mode");
+  if (String(eventPayload.provider || "").trim().toLowerCase() === "brevo") {
+    return blocked("brevo_blocked_in_engine", eventPayload);
   }
 
-  if (process.env.ENGINE_PUSH_TEST_ONLY !== "true") {
-    return blocked("engine_push_test_only_required");
-  }
+  const requestBody = {
+    ...eventPayload,
+    dry_run: effectiveDryRun,
+  };
 
-  const allowedSubscriptionId = String(
-    process.env.PUSH_TEST_SUBSCRIPTION_ID || "",
-  ).trim();
-  const requestedSubscriptionId = String(
-    eventPayload.subscription_id || "",
-  ).trim();
-
-  if (
-    !allowedSubscriptionId ||
-    !requestedSubscriptionId ||
-    requestedSubscriptionId !== allowedSubscriptionId
-  ) {
-    return blocked("subscription_not_allowed_in_engine_test_mode");
-  }
-
-  const backendBaseUrl = String(
-    process.env.BACKEND_INTERNAL_BASE_URL || "",
-  ).trim();
-  const internalEngineToken = String(
-    process.env.INTERNAL_ENGINE_TOKEN || "",
-  ).trim();
-
-  if (!backendBaseUrl || !internalEngineToken) {
-    return blocked("backend_internal_config_missing");
-  }
-
-  const logData = notificationLogData(eventPayload);
-  console.log("[push-watcher] notify:start", logData);
+  console.log("[push-watcher] notify:start", {
+    event_key: requestBody.event_key || null,
+    dedupe_key: requestBody.dedupe_key || null,
+    category: requestBody.category || null,
+    entity_type: requestBody.entity_type || null,
+    entity_id: requestBody.entity_id || null,
+    has_user_id: Boolean(requestBody.user_id),
+    audience_type: requestBody.audience?.type || null,
+    dry_run: effectiveDryRun,
+  });
 
   try {
     if (typeof globalThis.fetch !== "function") {
@@ -118,7 +127,7 @@ async function notifyBackendEvent(payload) {
           "Content-Type": "application/json",
           Authorization: `Bearer ${internalEngineToken}`,
         },
-        body: JSON.stringify(eventPayload),
+        body: JSON.stringify(requestBody),
       },
     );
 
@@ -131,8 +140,8 @@ async function notifyBackendEvent(payload) {
 
     if (!response.ok) {
       console.warn("[push-watcher] notify:failed", {
-        event_key: eventPayload.event_key || null,
-        dedupe_key: eventPayload.dedupe_key || null,
+        event_key: requestBody.event_key || null,
+        dedupe_key: requestBody.dedupe_key || null,
         status: response.status,
         message: data?.error || data?.message || "backend_request_failed",
       });
@@ -145,13 +154,14 @@ async function notifyBackendEvent(payload) {
     }
 
     console.log("[push-watcher] notify:done", {
-      event_key: eventPayload.event_key || null,
-      dedupe_key: eventPayload.dedupe_key || null,
-      ok: response.ok,
+      event_key: requestBody.event_key || null,
+      dedupe_key: requestBody.dedupe_key || null,
+      ok: data?.ok || false,
       deduped: data?.deduped || false,
       sent: data?.sent || 0,
       failed: data?.failed || 0,
       skipped: data?.skipped || 0,
+      blocked: data?.blocked || false,
     });
 
     return {
@@ -161,8 +171,8 @@ async function notifyBackendEvent(payload) {
     };
   } catch (error) {
     console.warn("[push-watcher] notify:failed", {
-      event_key: eventPayload.event_key || null,
-      dedupe_key: eventPayload.dedupe_key || null,
+      event_key: requestBody.event_key || null,
+      dedupe_key: requestBody.dedupe_key || null,
       status: null,
       message: error?.message || "backend_request_failed",
     });

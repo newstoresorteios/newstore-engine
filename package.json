@@ -3,6 +3,9 @@
   "private": true,
   "scripts": {
     "push:watcher": "node src/jobs/pushNotificationWatcher.js",
-    "push:test-dry-run": "node src/scripts/testPushSingleDeviceDryRun.js"
+    "push:test-single": "node src/scripts/testPushSingleUser.js"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
   }
 }

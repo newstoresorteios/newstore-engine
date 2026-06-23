@@ -1,0 +1,23 @@
+name: Push Notification Watcher
+
+on:
+  workflow_dispatch:
+
+jobs:
+  push-watcher:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - run: npm ci
+      - run: npm run push:watcher
+        env:
+          ENGINE_PUSH_WATCHER_ENABLED: "true"
+          ENGINE_PUSH_WATCHER_DRY_RUN: "true"
+          ENGINE_PUSH_ALLOW_PRODUCTION_AUDIENCE: "false"
+          ENGINE_PUSH_ALLOW_SINGLE_TEST_SEND: "false"
+          BACKEND_INTERNAL_BASE_URL: ${{ secrets.BACKEND_INTERNAL_BASE_URL }}
+          INTERNAL_ENGINE_TOKEN: ${{ secrets.INTERNAL_ENGINE_TOKEN }}
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
