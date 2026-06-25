@@ -1,8 +1,13 @@
 {
   "name": "newstore-engine",
   "private": true,
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
+    "push:automation:dry-run": "node src/scripts/testPushAutomationDryRun.js",
     "push:watcher": "node src/jobs/pushNotificationWatcher.js",
+    "push:test-dry-run": "node src/scripts/testPushSingleDeviceDryRun.js",
     "push:test-single": "node src/scripts/testPushSingleUser.js"
   },
   "dependencies": {
