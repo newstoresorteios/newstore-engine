@@ -5,6 +5,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
 from datetime import datetime, timezone, timedelta
+from push_automation_events import notify_new_draw_published
 
 # >>> utilidades para limpar a URL do Postgres e mascarar senha nos logs
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -410,6 +411,7 @@ def run():
         print(f"[run] total_slots (capacidade): {total_slots}")
 
         last_number = get_last_lotomania_number()
+        new_draw_ids = []
 
         for d in draws:
             draw_id = d["id"]
@@ -480,11 +482,17 @@ def run():
 
             # Abre novo sorteio apenas quando finalizamos um 'open' agora
             if open_will_be_finalized:
-                open_new_draw(conn)
+                new_draw_id = open_new_draw(conn)
+                new_draw_ids.append(new_draw_id)
 
         if COMMIT:
             conn.commit()
             print("[run] COMMIT aplicado.")
+            for new_draw_id in new_draw_ids:
+                notify_new_draw_published(
+                    new_draw_id,
+                    metadata={"draw_id": new_draw_id},
+                )
         else:
             conn.rollback()
             print("[run] DRY-RUN (rollback).")
