@@ -6,6 +6,7 @@ from psycopg2.extras import RealDictCursor
 import requests
 from datetime import datetime, timezone, timedelta
 from push_automation_events import notify_new_draw_published
+from push_automation_scan import run_push_automation_scan
 
 # >>> utilidades para limpar a URL do Postgres e mascarar senha nos logs
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
@@ -397,6 +398,16 @@ def get_last_lotomania_number():
     print(f"[lotomania] Último número sorteado: {ultimo}")
     return ultimo
 
+# --------- Push automation scanner ---------
+def _run_push_automation_scan_safely(conn):
+    if os.getenv("PUSH_AUTOMATION_SCAN_ENABLED", "false").lower() != "true":
+        return
+
+    try:
+        run_push_automation_scan(conn)
+    except Exception as exc:
+        print("[push-automation] scan failed:", exc)
+
 # --------- Main ---------
 def run():
     print("[run] iniciando", datetime.now(timezone.utc).isoformat())
@@ -405,6 +416,7 @@ def run():
         draws = get_pending_draws(conn)
         print(f"[run] sorteios pendentes: {[{'id': d['id'], 'status': d['status']} for d in draws]}")
         if not draws:
+            _run_push_automation_scan_safely(conn)
             return 0
 
         total_slots = _get_total_slots_from_config(conn)
@@ -497,6 +509,7 @@ def run():
             conn.rollback()
             print("[run] DRY-RUN (rollback).")
 
+        _run_push_automation_scan_safely(conn)
         return 0
     except Exception as e:
         print("[run] erro:", repr(e))

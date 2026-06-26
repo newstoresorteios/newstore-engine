@@ -24,9 +24,14 @@ def _allowed_event_key(event_key: str) -> bool:
     return event_key in allowed
 
 
-def notify_new_draw_published(draw_id: int, metadata: dict | None = None):
-    event_key = NEW_DRAW_PUBLISHED
-
+def notify_push_automation_event(
+    event_key: str,
+    reference_type: str,
+    reference_key: str,
+    metadata: dict | None = None,
+    recipient_user_ids: list[int] | None = None,
+    source: str = "engine",
+):
     if not _enabled():
         print("[push-automation] skipped: disabled")
         return {"ok": True, "skipped": True, "reason": "disabled"}
@@ -47,21 +52,20 @@ def notify_new_draw_published(draw_id: int, metadata: dict | None = None):
         })
         return {"ok": False, "blocked": True, "reason": "backend_config_missing"}
 
-    safe_metadata = metadata.copy() if isinstance(metadata, dict) else {}
-    safe_metadata["draw_id"] = draw_id
-
     payload = {
         "event_key": event_key,
-        "source": "engine",
-        "reference_type": "draw",
-        "reference_key": f"draw:{draw_id}",
-        "metadata": safe_metadata,
+        "source": source,
+        "reference_type": reference_type,
+        "reference_key": reference_key,
+        "metadata": metadata.copy() if isinstance(metadata, dict) else {},
     }
+    if recipient_user_ids is not None:
+        payload["recipient_user_ids"] = recipient_user_ids
 
     print("[push-automation] notify:start", {
         "event_key": event_key,
-        "reference_type": "draw",
-        "reference_key": payload["reference_key"],
+        "reference_type": reference_type,
+        "reference_key": reference_key,
     })
 
     try:
@@ -80,7 +84,7 @@ def notify_new_draw_published(draw_id: int, metadata: dict | None = None):
         if not response.ok:
             print("[push-automation] notify:failed", {
                 "event_key": event_key,
-                "reference_key": payload["reference_key"],
+                "reference_key": reference_key,
                 "status": response.status_code,
                 "message": (
                     data.get("error") or data.get("message")
@@ -96,14 +100,27 @@ def notify_new_draw_published(draw_id: int, metadata: dict | None = None):
 
         print("[push-automation] notify:done", {
             "event_key": event_key,
-            "reference_key": payload["reference_key"],
+            "reference_key": reference_key,
             "status": data.get("status") if isinstance(data, dict) else None,
         })
         return {"ok": True, "status": response.status_code, "data": data}
     except Exception as exc:
         print("[push-automation] notify:failed", {
             "event_key": event_key,
-            "reference_key": payload["reference_key"],
+            "reference_key": reference_key,
             "message": str(exc) or "backend_request_failed",
         })
         return {"ok": False, "reason": "backend_request_failed"}
+
+
+def notify_new_draw_published(draw_id: int, metadata: dict | None = None):
+    safe_metadata = metadata.copy() if isinstance(metadata, dict) else {}
+    safe_metadata["draw_id"] = draw_id
+
+    return notify_push_automation_event(
+        event_key=NEW_DRAW_PUBLISHED,
+        reference_type="draw",
+        reference_key=f"draw:{draw_id}",
+        metadata=safe_metadata,
+        source="engine",
+    )
