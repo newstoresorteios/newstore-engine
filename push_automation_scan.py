@@ -1,3 +1,4 @@
+import os
 from datetime import date, datetime
 
 from push_automation_events import notify_push_automation_event
@@ -12,12 +13,95 @@ BALANCE_EXPIRING_EVENTS = {
     10: "BALANCE_EXPIRING_10_DAYS",
     7: "BALANCE_EXPIRING_7_DAYS",
 }
+KNOWN_AUTOMATION_EVENT_KEYS = (
+    "NEW_DRAW_PUBLISHED",
+    "DRAW_REMAINING_NUMBERS_20",
+    "DRAW_REMAINING_NUMBERS_10",
+    "WINNER_DEFINED",
+    "BALANCE_EXPIRING_30_DAYS",
+    "BALANCE_EXPIRING_10_DAYS",
+    "BALANCE_EXPIRING_7_DAYS",
+    "BALANCE_EXPIRED",
+)
 
 
 def run_push_automation_scan(conn):
-    emit_remaining_numbers_events(conn)
-    emit_winner_defined_events(conn)
-    emit_balance_expiration_events(conn)
+    print("[push-automation] scan:start", _scan_config_snapshot())
+
+    remaining_summary = emit_remaining_numbers_events(conn)
+    winner_summary = emit_winner_defined_events(conn)
+    balance_summary = emit_balance_expiration_events(conn)
+
+    return {
+        "ok": True,
+        "remaining_numbers_checked": remaining_summary["checked"],
+        "winner_checked": winner_summary["checked"],
+        "balance_checked": balance_summary["checked"],
+        "events_attempted": (
+            remaining_summary["events_attempted"]
+            + winner_summary["events_attempted"]
+            + balance_summary["events_attempted"]
+        ),
+        "events_skipped": (
+            remaining_summary["events_skipped"]
+            + winner_summary["events_skipped"]
+            + balance_summary["events_skipped"]
+        ),
+        "remaining_numbers": remaining_summary,
+        "winner_defined": winner_summary,
+        "balance_expiration": balance_summary,
+    }
+
+
+def _env_true(name: str) -> bool:
+    return os.getenv(name, "").lower() == "true"
+
+
+def _allowed_events_count() -> int:
+    configured = os.getenv("PUSH_AUTOMATION_EVENT_KEYS", "").strip()
+    if not configured:
+        return len(KNOWN_AUTOMATION_EVENT_KEYS)
+
+    allowed = {
+        key.strip()
+        for key in configured.replace(";", ",").split(",")
+        if key.strip()
+    }
+    return len(allowed)
+
+
+def _scan_config_snapshot() -> dict:
+    return {
+        "enabled": _env_true("PUSH_AUTOMATION_SCAN_ENABLED"),
+        "events_enabled": _env_true("PUSH_AUTOMATION_EVENTS_ENABLED"),
+        "allowed_events_count": _allowed_events_count(),
+        "backend_configured": bool(os.getenv("BACKEND_INTERNAL_API_BASE", "").strip()),
+        "token_configured": bool(os.getenv("PUSH_INTERNAL_EVENTS_TOKEN", "").strip()),
+    }
+
+
+def _empty_summary() -> dict:
+    return {
+        "checked": 0,
+        "events_attempted": 0,
+        "events_skipped": 0,
+    }
+
+
+def _summarize_results(checked: int, results: list) -> dict:
+    return {
+        "checked": checked,
+        "events_attempted": len(results),
+        "events_skipped": sum(1 for result in results if isinstance(result, dict) and result.get("skipped")),
+    }
+
+
+def _log_group_done(group: str, summary: dict):
+    print(f"[push-automation] {group}:done", {
+        "checked": summary["checked"],
+        "events_attempted": summary["events_attempted"],
+        "events_skipped": summary["events_skipped"],
+    })
 
 
 def _table_columns(conn, table_name: str) -> dict:
@@ -116,10 +200,12 @@ def emit_remaining_numbers_events(conn):
     draws_cols = _table_columns(conn, "draws")
     if "id" not in draws_cols or "status" not in draws_cols:
         print("[push-automation] draws id/status columns not found")
-        return []
+        summary = _empty_summary()
+        _log_group_done("remaining_numbers", summary)
+        return summary
 
     total_numbers = _get_total_slots_from_config(conn)
-    emitted = []
+    results = []
 
     with conn.cursor() as cur:
         cur.execute("""
@@ -140,7 +226,7 @@ def emit_remaining_numbers_events(conn):
                 continue
 
             reference_key = f"draw:{draw_id}:remaining:{threshold}"
-            emitted.append(_notify_event(
+            results.append(_notify_event(
                 event_key=event_key,
                 reference_type="draw",
                 reference_key=reference_key,
@@ -153,14 +239,18 @@ def emit_remaining_numbers_events(conn):
                 source="engine",
             ))
 
-    return emitted
+    summary = _summarize_results(len(draws), results)
+    _log_group_done("remaining_numbers", summary)
+    return summary
 
 
 def emit_winner_defined_events(conn):
     draws_cols = _table_columns(conn, "draws")
     if "id" not in draws_cols or "status" not in draws_cols:
         print("[push-automation] draws id/status columns not found")
-        return []
+        summary = _empty_summary()
+        _log_group_done("winner_defined", summary)
+        return summary
 
     selected_cols = ["id"]
     if "winner_number" in draws_cols:
@@ -176,7 +266,9 @@ def emit_winner_defined_events(conn):
 
     if not defined_conditions:
         print("[push-automation] winner definition columns not found")
-        return []
+        summary = _empty_summary()
+        _log_group_done("winner_defined", summary)
+        return summary
 
     with conn.cursor() as cur:
         cur.execute(f"""
@@ -188,7 +280,7 @@ def emit_winner_defined_events(conn):
         """)
         draws = cur.fetchall() or []
 
-    emitted = []
+    results = []
     for draw in draws:
         draw_id = int(draw["id"])
         metadata = {"draw_id": draw_id}
@@ -196,7 +288,7 @@ def emit_winner_defined_events(conn):
         if winner_number is not None:
             metadata["winner_number"] = int(winner_number)
 
-        emitted.append(_notify_event(
+        results.append(_notify_event(
             event_key="WINNER_DEFINED",
             reference_type="draw",
             reference_key=f"draw:{draw_id}:winner_defined",
@@ -204,7 +296,9 @@ def emit_winner_defined_events(conn):
             source="engine",
         ))
 
-    return emitted
+    summary = _summarize_results(len(draws), results)
+    _log_group_done("winner_defined", summary)
+    return summary
 
 
 def emit_balance_expiration_events(conn):
@@ -212,9 +306,11 @@ def emit_balance_expiration_events(conn):
     required = {"id", "balance_cents", "coupon_expires_at"}
     if not required.issubset(set(user_cols)):
         print("[push-automation] users balance expiration columns not found")
-        return []
+        summary = _empty_summary()
+        _log_group_done("balance_expiration", summary)
+        return summary
 
-    emitted = []
+    results = []
     with conn.cursor() as cur:
         cur.execute("""
             SELECT
@@ -247,7 +343,7 @@ def emit_balance_expiration_events(conn):
             continue
 
         expires_at = _date_key(user["coupon_expires_at"])
-        emitted.append(_notify_event(
+        results.append(_notify_event(
             event_key=event_key,
             reference_type="balance",
             reference_key=f"balance:{user_id}:expiring:{expires_at}:{days_until}",
@@ -263,7 +359,7 @@ def emit_balance_expiration_events(conn):
     for user in expired_users:
         user_id = int(user["id"])
         expires_at = _date_key(user["coupon_expires_at"])
-        emitted.append(_notify_event(
+        results.append(_notify_event(
             event_key="BALANCE_EXPIRED",
             reference_type="balance",
             reference_key=f"balance:{user_id}:expired:{expires_at}",
@@ -275,4 +371,6 @@ def emit_balance_expiration_events(conn):
             source="engine",
         ))
 
-    return emitted
+    summary = _summarize_results(len(expiring_users) + len(expired_users), results)
+    _log_group_done("balance_expiration", summary)
+    return summary

@@ -101,7 +101,8 @@ def notify_push_automation_event(
         print("[push-automation] notify:done", {
             "event_key": event_key,
             "reference_key": reference_key,
-            "status": data.get("status") if isinstance(data, dict) else None,
+            "status": response.status_code,
+            "backend_status": data.get("status") if isinstance(data, dict) else None,
         })
         return {"ok": True, "status": response.status_code, "data": data}
     except Exception as exc:
