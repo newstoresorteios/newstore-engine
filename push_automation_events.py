@@ -31,6 +31,8 @@ def notify_push_automation_event(
     metadata: dict | None = None,
     recipient_user_ids: list[int] | None = None,
     source: str = "engine",
+    scan_id: str | None = None,
+    occurred_at: str | None = None,
 ):
     if not _enabled():
         print("[push-automation] skipped: disabled")
@@ -59,6 +61,10 @@ def notify_push_automation_event(
         "reference_key": reference_key,
         "metadata": metadata.copy() if isinstance(metadata, dict) else {},
     }
+    if scan_id:
+        payload["scan_id"] = scan_id
+    if occurred_at:
+        payload["occurred_at"] = occurred_at
     if recipient_user_ids is not None:
         payload["recipient_user_ids"] = recipient_user_ids
 

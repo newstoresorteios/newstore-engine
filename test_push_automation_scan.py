@@ -10,8 +10,11 @@ def _empty_summary(ok=True):
         "remaining_numbers_checked": 0,
         "winner_checked": 0,
         "balance_checked": 0,
+        "events_candidates": 0,
         "events_attempted": 0,
+        "events_blocked": 0,
         "events_skipped": 0,
+        "events_sent_to_backend": 0,
     }
 
 
@@ -28,11 +31,16 @@ def run_manual_scan():
         conn.rollback()
         print("[push-automation] scan:finished", {
             "ok": summary.get("ok") is True,
+            "scan_id": summary.get("scan_id"),
             "remaining_numbers_checked": summary.get("remaining_numbers_checked", 0),
             "winner_checked": summary.get("winner_checked", 0),
             "balance_checked": summary.get("balance_checked", 0),
+            "events_candidates": summary.get("events_candidates", 0),
             "events_attempted": summary.get("events_attempted", 0),
+            "events_blocked": summary.get("events_blocked", 0),
             "events_skipped": summary.get("events_skipped", 0),
+            "events_sent_to_backend": summary.get("events_sent_to_backend", 0),
+            "by_event_key": summary.get("by_event_key", {}),
         })
         return 0
     except Exception as exc:
