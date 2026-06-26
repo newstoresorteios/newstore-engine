@@ -20,6 +20,21 @@ Funciona com Supabase Postgres (usa `POSTGRES_URL`).
 - `CHECK_LAST_K` (padrão `2`)
 - `LOTOMANIA_ENDPOINT` (padrão `https://servicebus2.caixa.gov.br/portaldeloterias/api/lotomania`)
 
+### Push Automation
+O engine nao envia Push diretamente. Ele emite eventos para o backend, que decide o envio real.
+
+Exemplo de configuracao para producao:
+
+```env
+PUSH_AUTOMATION_EVENTS_ENABLED=true
+PUSH_AUTOMATION_SCAN_ENABLED=true
+PUSH_AUTOMATION_EVENT_KEYS=NEW_DRAW_PUBLISHED,DRAW_REMAINING_NUMBERS_20,DRAW_REMAINING_NUMBERS_10,WINNER_DEFINED,BALANCE_EXPIRING_30_DAYS,BALANCE_EXPIRING_10_DAYS,BALANCE_EXPIRING_7_DAYS,BALANCE_EXPIRED
+BACKEND_INTERNAL_API_BASE=https://newstore-backend.onrender.com
+PUSH_INTERNAL_EVENTS_TOKEN=
+```
+
+Use em `PUSH_INTERNAL_EVENTS_TOKEN` o mesmo valor configurado no backend. Nao coloque token real em arquivos versionados.
+
 ## Local
 ```bash
 python -m venv .venv && . .venv/bin/activate
