@@ -42,12 +42,15 @@ PUSH_AUTOMATION_REMAINING_LOOKBACK_HOURS=24
 PUSH_AUTOMATION_REMAINING_MAX_EVENTS_PER_SCAN=1
 PUSH_AUTOMATION_BALANCE_LOOKBACK_HOURS=24
 PUSH_AUTOMATION_BALANCE_MAX_EVENTS_PER_SCAN=5
+TRAY_COUPON_VALID_DAYS=180
 BACKEND_INTERNAL_API_BASE=https://newstore-backend.onrender.com
 PUSH_INTERNAL_EVENTS_TOKEN=
 ```
 
 Use em `PUSH_INTERNAL_EVENTS_TOKEN` o mesmo valor configurado no backend. Nao coloque token real em arquivos versionados.
 Use `PUSH_AUTOMATION_PREVIEW_ONLY=true` para validar candidatos sem chamar o backend. Por padrao, o scanner bloqueia backfill historico, exige `occurred_at`, aplica janela de 24h e limita lotes grandes.
+
+Balance automation usa `users.coupon_value_cents` como saldo, `users.coupon_updated_at` como base temporal e calcula o vencimento com `TRAY_COUPON_VALID_DAYS`.
 
 ## Local
 ```bash

@@ -146,6 +146,10 @@ def _scan_config() -> dict:
     }
 
 
+def _coupon_valid_days() -> int:
+    return _env_int("TRAY_COUPON_VALID_DAYS", 180, 1)
+
+
 def _generate_scan_id() -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"push-scan:{timestamp}:{secrets.token_hex(4)}"
@@ -507,9 +511,27 @@ def _process_candidates(
     checked: int,
     group: str,
     specific_max_by_key: dict[str, int] | None = None,
+    group_max_events: int | None = None,
 ) -> dict:
     specific_max_by_key = specific_max_by_key or {}
     results = []
+    if (
+        group_max_events is not None
+        and not ctx["config"]["allow_large_batch"]
+        and len(candidates) > group_max_events
+    ):
+        event_key = "BALANCE_*" if group == "balance_expiration" else (candidates[0]["event_key"] if candidates else group)
+        results = _block_large_batch(
+            ctx,
+            event_key,
+            len(candidates),
+            group_max_events,
+            f"{group}_max_events_per_scan",
+        )
+        summary = _summary_from_results(checked, results)
+        _log_group_done(group, summary)
+        return summary
+
     grouped = defaultdict(list)
     for candidate in candidates:
         grouped[candidate["event_key"]].append(candidate)
@@ -809,85 +831,152 @@ def emit_winner_defined_events(conn, ctx: dict):
 
 def emit_balance_expiration_events(conn, ctx: dict):
     user_cols = _table_columns(conn, "users")
-    required = {"id", "balance_cents", "coupon_expires_at"}
+    required = {"id", "coupon_value_cents", "coupon_updated_at"}
     if not required.issubset(set(user_cols)):
+        print("[push-automation] balance:schema", {
+            "ok": False,
+            "has_user_id": "id" in user_cols,
+            "has_coupon_value_cents": "coupon_value_cents" in user_cols,
+            "has_coupon_updated_at": "coupon_updated_at" in user_cols,
+        })
         print("[push-automation] users balance expiration columns not found")
         summary = _empty_summary()
         _log_group_done("balance_expiration", summary)
         return summary
 
     candidates = []
-    checked = 0
     now = datetime.now(timezone.utc)
     lookback_hours = ctx["config"]["balance_lookback_hours"]
+    valid_days = _coupon_valid_days()
+    print("[push-automation] balance:schema", {
+        "ok": True,
+        "source_table": "users",
+        "value_column": "coupon_value_cents",
+        "updated_at_column": "coupon_updated_at",
+        "valid_days": valid_days,
+    })
 
     with conn.cursor() as cur:
         cur.execute("""
+            SELECT COUNT(*) AS users_checked
+              FROM users
+             WHERE coupon_value_cents > 0
+               AND coupon_updated_at IS NOT NULL
+        """)
+        row = cur.fetchone() or {}
+        users_checked = int(row.get("users_checked") or 0)
+
+        cur.execute("""
             SELECT
                 id,
-                coupon_expires_at,
-                (coupon_expires_at::date - CURRENT_DATE) AS days_until
+                coupon_value_cents,
+                coupon_updated_at,
+                coupon_updated_at + (%s * INTERVAL '1 day') AS coupon_expires_at,
+                ((coupon_updated_at + (%s * INTERVAL '1 day'))::date - CURRENT_DATE)
+                    AS days_until_expiration
               FROM users
-             WHERE balance_cents > 0
-               AND coupon_expires_at IS NOT NULL
-               AND (coupon_expires_at::date - CURRENT_DATE) = ANY(%s::int[])
-             ORDER BY id ASC
-        """, (list(BALANCE_EXPIRING_EVENTS.keys()),))
+             WHERE coupon_value_cents > 0
+               AND coupon_updated_at IS NOT NULL
+               AND ((coupon_updated_at + (%s * INTERVAL '1 day'))::date - CURRENT_DATE)
+                   = ANY(%s::int[])
+             ORDER BY coupon_expires_at ASC, id ASC
+        """, (
+            valid_days,
+            valid_days,
+            valid_days,
+            list(BALANCE_EXPIRING_EVENTS.keys()),
+        ))
         expiring_users = cur.fetchall() or []
 
         expired_where = """
-            balance_cents > 0
-            AND coupon_expires_at IS NOT NULL
-            AND coupon_expires_at::date < CURRENT_DATE
+            coupon_value_cents > 0
+            AND coupon_updated_at IS NOT NULL
+            AND coupon_updated_at + (%s * INTERVAL '1 day') <= NOW()
         """
-        expired_params = []
+        expired_params = [valid_days]
         if ctx["config"]["no_backfill"]:
-            expired_where += " AND coupon_expires_at >= NOW() - (%s * INTERVAL '1 hour')"
+            expired_where += """
+                AND coupon_updated_at + (%s * INTERVAL '1 day')
+                    >= NOW() - (%s * INTERVAL '1 hour')
+            """
+            expired_params.append(valid_days)
             expired_params.append(lookback_hours)
 
         cur.execute(f"""
-            SELECT id, coupon_expires_at
+            SELECT
+                id,
+                coupon_value_cents,
+                coupon_updated_at,
+                coupon_updated_at + (%s * INTERVAL '1 day') AS coupon_expires_at,
+                ((coupon_updated_at + (%s * INTERVAL '1 day'))::date - CURRENT_DATE)
+                    AS days_until_expiration
               FROM users
              WHERE {expired_where}
              ORDER BY coupon_expires_at DESC, id ASC
-        """, tuple(expired_params))
+        """, tuple([valid_days, valid_days] + expired_params))
         expired_users = cur.fetchall() or []
 
-    checked = len(expiring_users) + len(expired_users)
+    checked = users_checked
 
     for user in expiring_users:
         user_id = int(user["id"])
-        days_until = int(user["days_until"])
+        days_until = int(user["days_until_expiration"])
         event_key = BALANCE_EXPIRING_EVENTS.get(days_until)
         if not event_key:
             continue
 
+        coupon_value_cents = int(user["coupon_value_cents"] or 0)
         expires_at = _date_key(user["coupon_expires_at"])
+        coupon_expires_at = _iso_datetime(user["coupon_expires_at"])
+        print("[push-automation] balance:event_candidate", {
+            "event_key": event_key,
+            "reference_type": "user_balance",
+            "reference_key": f"user:{user_id}:balance_expiring:{days_until}:{expires_at}",
+            "days_until_expiration": days_until,
+            "valid_days": valid_days,
+        })
         candidates.append({
             "event_key": event_key,
-            "reference_type": "balance",
-            "reference_key": f"balance:{user_id}:expiring:{expires_at}:{days_until}",
+            "reference_type": "user_balance",
+            "reference_key": f"user:{user_id}:balance_expiring:{days_until}:{expires_at}",
             "recipient_user_ids": [user_id],
             "occurred_at": now,
             "metadata": {
                 "user_id": user_id,
-                "days_until_expiry": days_until,
-                "expires_at": expires_at,
+                "balance_cents": coupon_value_cents,
+                "coupon_value_cents": coupon_value_cents,
+                "coupon_expires_at": coupon_expires_at,
+                "days_until_expiration": days_until,
+                "valid_days": valid_days,
             },
         })
 
     for user in expired_users:
         user_id = int(user["id"])
+        coupon_value_cents = int(user["coupon_value_cents"] or 0)
         expires_at = _date_key(user["coupon_expires_at"])
+        coupon_expires_at = _iso_datetime(user["coupon_expires_at"])
+        days_until = int(user["days_until_expiration"])
+        print("[push-automation] balance:event_candidate", {
+            "event_key": "BALANCE_EXPIRED",
+            "reference_type": "user_balance",
+            "reference_key": f"user:{user_id}:balance_expired:{expires_at}",
+            "days_until_expiration": days_until,
+            "valid_days": valid_days,
+        })
         candidates.append({
             "event_key": "BALANCE_EXPIRED",
-            "reference_type": "balance",
-            "reference_key": f"balance:{user_id}:expired:{expires_at}",
+            "reference_type": "user_balance",
+            "reference_key": f"user:{user_id}:balance_expired:{expires_at}",
             "recipient_user_ids": [user_id],
             "occurred_at": user["coupon_expires_at"],
             "metadata": {
                 "user_id": user_id,
-                "expires_at": expires_at,
+                "balance_cents": coupon_value_cents,
+                "coupon_value_cents": coupon_value_cents,
+                "coupon_expires_at": coupon_expires_at,
+                "days_until_expiration": days_until,
+                "valid_days": valid_days,
             },
         })
 
@@ -896,11 +985,12 @@ def emit_balance_expiration_events(conn, ctx: dict):
             cur.execute("""
                 SELECT COUNT(*) AS ignored_count
                   FROM users
-                 WHERE balance_cents > 0
-                   AND coupon_expires_at IS NOT NULL
-                   AND coupon_expires_at::date < CURRENT_DATE
-                   AND coupon_expires_at < NOW() - (%s * INTERVAL '1 hour')
-            """, (lookback_hours,))
+                 WHERE coupon_value_cents > 0
+                   AND coupon_updated_at IS NOT NULL
+                   AND coupon_updated_at + (%s * INTERVAL '1 day') <= NOW()
+                   AND coupon_updated_at + (%s * INTERVAL '1 day')
+                       < NOW() - (%s * INTERVAL '1 hour')
+            """, (valid_days, valid_days, lookback_hours))
             row = cur.fetchone() or {}
             _log_lookback_filter(
                 "BALANCE_EXPIRED",
@@ -909,7 +999,15 @@ def emit_balance_expiration_events(conn, ctx: dict):
                 "balance_expired_outside_lookback",
             )
 
-    return _process_candidates(
+    print("[push-automation] balance:candidates", {
+        "valid_days": valid_days,
+        "users_checked": checked,
+        "candidates_count": len(candidates),
+        "expiring_candidates": len(expiring_users),
+        "expired_candidates": len(expired_users),
+    })
+
+    summary = _process_candidates(
         ctx,
         candidates,
         checked,
@@ -920,4 +1018,14 @@ def emit_balance_expiration_events(conn, ctx: dict):
             "BALANCE_EXPIRING_7_DAYS",
             "BALANCE_EXPIRED",
         )},
+        group_max_events=ctx["config"]["balance_max_events_per_scan"],
     )
+    print("[push-automation] balance:done", {
+        "valid_days": valid_days,
+        "users_checked": checked,
+        "candidates_count": summary["events_candidates"],
+        "events_attempted": summary["events_attempted"],
+        "events_blocked": summary["events_blocked"],
+        "events_skipped": summary["events_skipped"],
+    })
+    return summary
