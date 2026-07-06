@@ -140,6 +140,7 @@ def get_pending_draws(conn):
               FROM draws
              WHERE status IN ('open','closed')
                AND (status = 'open' OR realized_at IS NULL)
+               AND COALESCE(draw_type, 'principal') = 'principal'
              ORDER BY id ASC
         """)
         return cur.fetchall() or []
@@ -151,6 +152,7 @@ def get_open_draws_with_meta(conn):
             SELECT id, opened_at
               FROM draws
              WHERE status = 'open'
+               AND COALESCE(draw_type, 'principal') = 'principal'
              ORDER BY id ASC
         """)
         return cur.fetchall() or []
@@ -224,45 +226,15 @@ def _get_total_slots_from_config(conn) -> int:
 
 def get_sold_count(conn, draw_id: int) -> int:
     """
-    Conta quantos números estão efetivamente 'vendidos' (reservations paid OU payment approved/paid).
-    Suporta schema com 'number' (int) ou 'numbers' (int[]).
+    Conta quantos números estão efetivamente vendidos no draw.
     """
     with conn.cursor() as cur:
-        # Descobre as colunas disponíveis em reservations
         cur.execute("""
-            SELECT column_name, data_type
-              FROM information_schema.columns
-             WHERE table_schema = 'public'
-               AND table_name   = 'reservations'
-        """)
-        cols = {row["column_name"]: row["data_type"] for row in cur.fetchall()}
-
-        if "number" in cols:
-            query = """
-                SELECT COUNT(DISTINCT r.number) AS sold
-                  FROM reservations r
-             LEFT JOIN payments p ON p.id = r.payment_id
-                 WHERE r.draw_id = %s
-                   AND (r.status = 'paid' OR p.status IN ('approved','paid'))
-            """
-            params = (draw_id,)
-        elif "numbers" in cols:
-            # unnests numbers[] para contar distintos
-            query = """
-                WITH flat AS (
-                    SELECT UNNEST(r.numbers) AS num
-                      FROM reservations r
-                 LEFT JOIN payments p ON p.id = r.payment_id
-                     WHERE r.draw_id = %s
-                       AND (r.status = 'paid' OR p.status IN ('approved','paid'))
-                )
-                SELECT COUNT(DISTINCT num) AS sold FROM flat
-            """
-            params = (draw_id,)
-        else:
-            raise RuntimeError("Tabela reservations não possui colunas 'number' nem 'numbers'.")
-
-        cur.execute(query, params)
+            SELECT COUNT(*) AS sold
+              FROM public.numbers
+             WHERE draw_id = %s
+               AND status = 'sold'
+        """, (draw_id,))
         row = cur.fetchone()
         return int(row["sold"] or 0)
 
@@ -309,8 +281,8 @@ def open_new_draw(conn):
     """Abre um novo sorteio 'open'. Ajuste os campos se sua tabela exigir mais colunas."""
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO draws (status, opened_at)
-            VALUES ('open', NOW())
+            INSERT INTO draws (status, opened_at, draw_type)
+            VALUES ('open', NOW(), 'principal')
             RETURNING id
         """)
         new_id = cur.fetchone()["id"]
@@ -324,45 +296,112 @@ def get_user_email(conn, user_id: int):
         if not row: return None, None
         return row["name"], row["email"]
 
-def paid_user_for_number(conn, draw_id: int, number: int):
+def _winner_name_from_user(name, email):
+    clean_name = (name or "").strip()
+    if clean_name:
+        return clean_name
+    clean_email = (email or "").strip()
+    return clean_email or None
+
+def _winner_identity_from_row(row):
+    if not row or not row.get("user_id"):
+        return None, None, None
+    return (
+        row["user_id"],
+        _winner_name_from_user(row.get("name"), row.get("email")),
+        row.get("email"),
+    )
+
+def paid_user_for_number_fallback(conn, draw_id: int, number: int):
+    """Compatibility fallback when public.numbers has sold row without reservation_id."""
     with conn.cursor() as cur:
-        # Descobre as colunas disponíveis
         cur.execute("""
-            SELECT column_name, data_type
-              FROM information_schema.columns
-             WHERE table_schema = 'public'
-               AND table_name   = 'reservations'
-        """)
-        cols = {row["column_name"]: row["data_type"] for row in cur.fetchall()}
-
-        if "number" in cols:
-            query = """
-                SELECT r.user_id
-                  FROM reservations r
-             LEFT JOIN payments p ON p.id = r.payment_id
-                 WHERE r.draw_id = %s
-                   AND r.number  = %s
-                   AND (r.status = 'paid' OR p.status IN ('approved','paid'))
-                 LIMIT 1
-            """
-            params = (draw_id, number)
-        elif "numbers" in cols:
-            query = """
-                SELECT r.user_id
-                  FROM reservations r
-             LEFT JOIN payments p ON p.id = r.payment_id
-                 WHERE r.draw_id = %s
-                   AND ( %s = ANY(r.numbers) OR r.numbers @> ARRAY[%s]::int[] )
-                   AND (r.status = 'paid' OR p.status IN ('approved','paid'))
-                 LIMIT 1
-            """
-            params = (draw_id, number, number)
-        else:
-            raise RuntimeError("Tabela reservations não possui colunas 'number' nem 'numbers'.")
-
-        cur.execute(query, params)
+            SELECT r.user_id, u.name, u.email
+              FROM public.reservations r
+         LEFT JOIN public.payments p ON p.id = r.payment_id AND p.draw_id = %s
+         LEFT JOIN public.users u ON u.id = r.user_id
+             WHERE r.draw_id = %s
+               AND %s = ANY(r.numbers)
+               AND (r.status = 'paid' OR p.status IN ('approved','paid'))
+             LIMIT 1
+        """, (draw_id, draw_id, number))
         r = cur.fetchone()
-        return r["user_id"] if r else None
+        user_id, winner_name, winner_email = _winner_identity_from_row(r)
+        print("[winner] fallback lookup", {
+            "draw_id": draw_id,
+            "winner_number": number,
+            "fallback_used": True,
+            "winner_user_id": user_id,
+        })
+        return user_id, winner_name, winner_email
+
+def winner_for_number(conn, draw_id: int, number: int):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT n, status, reservation_id
+              FROM public.numbers
+             WHERE draw_id = %s
+               AND n = %s
+             LIMIT 1
+        """, (draw_id, number))
+        number_row = cur.fetchone()
+
+        if not number_row:
+            print("[winner] number not found", {
+                "draw_id": draw_id,
+                "winner_number": number,
+            })
+            return None, None, None
+
+        number_status = (number_row.get("status") or "").strip().lower()
+        reservation_id = number_row.get("reservation_id")
+        print("[winner] number lookup", {
+            "draw_id": draw_id,
+            "winner_number": number,
+            "number_status": number_status,
+            "reservation_id": reservation_id,
+        })
+
+        if number_status != "sold":
+            print("[winner] number is not sold", {
+                "draw_id": draw_id,
+                "winner_number": number,
+                "number_status": number_status,
+            })
+            return None, None, None
+
+        if reservation_id:
+            cur.execute("""
+                SELECT r.user_id, u.name, u.email
+                  FROM public.reservations r
+             LEFT JOIN public.users u ON u.id = r.user_id
+                 WHERE r.id = %s
+                   AND r.draw_id = %s
+                 LIMIT 1
+            """, (reservation_id, draw_id))
+            reservation_row = cur.fetchone()
+            user_id, winner_name, winner_email = _winner_identity_from_row(reservation_row)
+            if user_id:
+                print("[winner] reservation resolved", {
+                    "draw_id": draw_id,
+                    "winner_number": number,
+                    "reservation_id": reservation_id,
+                    "winner_user_id": user_id,
+                })
+                return user_id, winner_name, winner_email
+
+            print("[winner] reservation not resolved", {
+                "draw_id": draw_id,
+                "winner_number": number,
+                "reservation_id": reservation_id,
+            })
+            return None, None, None
+
+    print("[winner] sold number without reservation_id; using fallback", {
+        "draw_id": draw_id,
+        "winner_number": number,
+    })
+    return paid_user_for_number_fallback(conn, draw_id, number)
 
 def get_participants(conn, draw_id: int):
     """
@@ -458,12 +497,7 @@ def run():
                 continue
 
             # Determina vencedor pelo último número da Lotomania
-            winner_user_id = paid_user_for_number(conn, draw_id, last_number)
-
-            # Dados do vencedor (se houver)
-            winner_name, winner_email = (None, None)
-            if winner_user_id:
-                winner_name, winner_email = get_user_email(conn, winner_user_id)
+            winner_user_id, winner_name, winner_email = winner_for_number(conn, draw_id, last_number)
 
             # Marca sorteado (funciona para open/closed) — agora persiste também winner_name
             set_draw_sorteado_any_status(conn, draw_id, last_number, winner_user_id, winner_name)

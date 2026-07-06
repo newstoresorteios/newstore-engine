@@ -92,6 +92,7 @@ def get_open_draw(conn):
             select id, opened_at
               from draws
              where status = 'open'
+               and coalesce(draw_type, 'principal') = 'principal'
              order by id desc
              limit 1
             """

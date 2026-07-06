@@ -56,6 +56,7 @@ async function getOpenDraws() {
     SELECT id, opened_at
       FROM draws
      WHERE status = 'open'
+       AND COALESCE(draw_type, 'principal') = 'principal'
      ORDER BY id ASC
   `);
 

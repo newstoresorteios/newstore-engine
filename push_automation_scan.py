@@ -628,6 +628,7 @@ def emit_remaining_numbers_events(conn, ctx: dict):
             SELECT {', '.join(_quote_ident(column) for column in selected_cols)}
               FROM draws
              WHERE status IN ('open', 'active', 'aberto')
+               AND COALESCE(draw_type, 'principal') = 'principal'
              ORDER BY {order_sql}
              LIMIT 1
         """)
