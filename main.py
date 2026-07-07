@@ -5,7 +5,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
 from datetime import datetime, timezone, timedelta
-from push_automation_events import notify_new_draw_published
+from push_automation_events import notify_new_draw_published, notify_push_automation_event
 from push_automation_scan import run_push_automation_scan
 
 # >>> utilidades para limpar a URL do Postgres e mascarar senha nos logs
@@ -131,17 +131,17 @@ def db():
 def get_pending_draws(conn):
     """
     Retorna:
-      - todos os 'open' (podem ou não fechar agora);
-      - e os 'closed' com realized_at IS NULL (precisam ser finalizados e comunicados).
+      - o sorteio principal 'closed' mais recente com realized_at IS NULL.
     """
     with conn.cursor() as cur:
         cur.execute("""
             SELECT id, status, opened_at
               FROM draws
-             WHERE status IN ('open','closed')
-               AND (status = 'open' OR realized_at IS NULL)
+             WHERE status = 'closed'
+               AND realized_at IS NULL
                AND COALESCE(draw_type, 'principal') = 'principal'
-             ORDER BY id ASC
+             ORDER BY id DESC
+             LIMIT 1
         """)
         return cur.fetchall() or []
 
@@ -463,6 +463,8 @@ def run():
 
         last_number = get_last_lotomania_number()
         new_draw_ids = []
+        email_notifications = []
+        winner_defined_events = []
 
         for d in draws:
             draw_id = d["id"]
@@ -502,30 +504,52 @@ def run():
             # Marca sorteado (funciona para open/closed) — agora persiste também winner_name
             set_draw_sorteado_any_status(conn, draw_id, last_number, winner_user_id, winner_name)
 
-            # E-mail para vencedor (se houver)
+            winner_metadata = {
+                "draw_id": draw_id,
+                "winner_number": last_number,
+            }
+            if winner_user_id is not None:
+                winner_metadata["winner_user_id"] = winner_user_id
+            if winner_name:
+                winner_metadata["winner_name"] = winner_name
+            winner_defined_events.append({
+                "event_key": "WINNER_DEFINED",
+                "reference_type": "draw",
+                "reference_key": f"draw:{draw_id}:winner_defined",
+                "metadata": winner_metadata,
+            })
+            # E-mail para vencedor (se houver) - enfileirado para envio apos commit
             if winner_user_id and winner_email:
-                send_winner_email(winner_email, winner_name or "Participante", draw_label, draw_id, last_number)
+                email_notifications.append((
+                    "winner",
+                    (winner_email, winner_name or "Participante", draw_label, draw_id, last_number),
+                ))
             elif winner_user_id and not winner_email:
                 print(f"[email] usuário {winner_user_id} sem e-mail; não foi possível notificar vencedor.")
 
             # Admin sempre recebe (com nome/numero do vencedor quando houver)
-            send_draw_closed_admin(draw_label, draw_id, last_number, winner_name, winner_email)
+            email_notifications.append((
+                "admin",
+                (draw_label, draw_id, last_number, winner_name, winner_email),
+            ))
 
             # Participantes não contemplados (com info do vencedor)
             parts = get_participants(conn, draw_id)
             loser_list = [p for p in parts if p["id"] != (winner_user_id or -1)]
-            print(f"[draw {draw_id}] enviando e-mail de 'não contemplado' para {len(loser_list)} participantes")
+            email_notifications.append(("loser_count", (draw_id, len(loser_list))))
             for p in loser_list:
                 if p.get("email"):
-                    send_loser_email(
-                        p["email"],
-                        p.get("name") or "Participante",
-                        draw_label,
-                        draw_id,
-                        last_number,
-                        winner_name or "-"
-                    )
-
+                    email_notifications.append((
+                        "loser",
+                        (
+                            p["email"],
+                            p.get("name") or "Participante",
+                            draw_label,
+                            draw_id,
+                            last_number,
+                            winner_name or "-",
+                        ),
+                    ))
             # Abre novo sorteio apenas quando finalizamos um 'open' agora
             if open_will_be_finalized:
                 new_draw_id = open_new_draw(conn)
@@ -534,6 +558,33 @@ def run():
         if COMMIT:
             conn.commit()
             print("[run] COMMIT aplicado.")
+            for winner_event in winner_defined_events:
+                try:
+                    response = notify_push_automation_event(**winner_event)
+                    if isinstance(response, dict) and response.get("ok") is False:
+                        print("[push-automation] winner_defined not sent:", {
+                            "reference_key": winner_event.get("reference_key"),
+                            "reason": response.get("reason"),
+                            "status": response.get("status"),
+                        })
+                except Exception as event_exc:
+                    print("[push-automation] winner_defined failed after commit:", {
+                        "reference_key": winner_event.get("reference_key"),
+                        "message": str(event_exc) or "event_failed",
+                    })
+            for email_kind, email_args in email_notifications:
+                try:
+                    if email_kind == "winner":
+                        send_winner_email(*email_args)
+                    elif email_kind == "admin":
+                        send_draw_closed_admin(*email_args)
+                    elif email_kind == "loser_count":
+                        queued_draw_id, queued_count = email_args
+                        print(f"[draw {queued_draw_id}] enviando e-mail de 'não contemplado' para {queued_count} participantes")
+                    elif email_kind == "loser":
+                        send_loser_email(*email_args)
+                except Exception as email_exc:
+                    print("[email] erro apos commit:", repr(email_exc))
             for new_draw_id in new_draw_ids:
                 notify_new_draw_published(
                     new_draw_id,
