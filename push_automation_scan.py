@@ -9,20 +9,24 @@ from push_automation_events import notify_push_automation_event
 REMAINING_THRESHOLDS = (
     (10, "DRAW_REMAINING_NUMBERS_10"),
     (20, "DRAW_REMAINING_NUMBERS_20"),
+    (50, "DRAW_REMAINING_NUMBERS_50"),
     (75, "DRAW_REMAINING_NUMBERS_75"),
 )
 BALANCE_EXPIRING_EVENTS = {
     30: "BALANCE_EXPIRING_30_DAYS",
+    15: "BALANCE_EXPIRING_15_DAYS",
     10: "BALANCE_EXPIRING_10_DAYS",
     7: "BALANCE_EXPIRING_7_DAYS",
 }
 KNOWN_AUTOMATION_EVENT_KEYS = (
     "NEW_DRAW_PUBLISHED",
     "DRAW_REMAINING_NUMBERS_75",
+    "DRAW_REMAINING_NUMBERS_50",
     "DRAW_REMAINING_NUMBERS_20",
     "DRAW_REMAINING_NUMBERS_10",
     "WINNER_DEFINED",
     "BALANCE_EXPIRING_30_DAYS",
+    "BALANCE_EXPIRING_15_DAYS",
     "BALANCE_EXPIRING_10_DAYS",
     "BALANCE_EXPIRING_7_DAYS",
     "BALANCE_EXPIRED",
@@ -651,7 +655,7 @@ def emit_remaining_numbers_events(conn, ctx: dict):
         sold_snapshot = _get_sold_snapshot(conn, draw_id)
         sold_numbers = int(sold_snapshot["sold"])
         remaining_numbers = max(total_numbers - sold_numbers, 0)
-        if remaining_numbers > 20 and remaining_numbers != 75:
+        if remaining_numbers > 20 and remaining_numbers not in (50, 75):
             continue
 
         occurred_at = _latest_datetime(
@@ -673,7 +677,9 @@ def emit_remaining_numbers_events(conn, ctx: dict):
             continue
 
         if remaining_numbers == 75:
-            threshold, event_key = REMAINING_THRESHOLDS[2]
+            threshold, event_key = 75, "DRAW_REMAINING_NUMBERS_75"
+        elif remaining_numbers == 50:
+            threshold, event_key = 50, "DRAW_REMAINING_NUMBERS_50"
         else:
             threshold, event_key = REMAINING_THRESHOLDS[0] if remaining_numbers <= 10 else REMAINING_THRESHOLDS[1]
         candidates.append({
@@ -705,6 +711,7 @@ def emit_remaining_numbers_events(conn, ctx: dict):
         "remaining_numbers",
         {
             "DRAW_REMAINING_NUMBERS_75": ctx["config"]["remaining_max_events_per_scan"],
+            "DRAW_REMAINING_NUMBERS_50": ctx["config"]["remaining_max_events_per_scan"],
             "DRAW_REMAINING_NUMBERS_20": ctx["config"]["remaining_max_events_per_scan"],
             "DRAW_REMAINING_NUMBERS_10": ctx["config"]["remaining_max_events_per_scan"],
         },
@@ -1021,6 +1028,7 @@ def emit_balance_expiration_events(conn, ctx: dict):
         "balance_expiration",
         {event_key: ctx["config"]["balance_max_events_per_scan"] for event_key in (
             "BALANCE_EXPIRING_30_DAYS",
+            "BALANCE_EXPIRING_15_DAYS",
             "BALANCE_EXPIRING_10_DAYS",
             "BALANCE_EXPIRING_7_DAYS",
             "BALANCE_EXPIRED",
