@@ -9,6 +9,7 @@ from push_automation_events import notify_push_automation_event
 REMAINING_THRESHOLDS = (
     (10, "DRAW_REMAINING_NUMBERS_10"),
     (20, "DRAW_REMAINING_NUMBERS_20"),
+    (75, "DRAW_REMAINING_NUMBERS_75"),
 )
 BALANCE_EXPIRING_EVENTS = {
     30: "BALANCE_EXPIRING_30_DAYS",
@@ -17,6 +18,7 @@ BALANCE_EXPIRING_EVENTS = {
 }
 KNOWN_AUTOMATION_EVENT_KEYS = (
     "NEW_DRAW_PUBLISHED",
+    "DRAW_REMAINING_NUMBERS_75",
     "DRAW_REMAINING_NUMBERS_20",
     "DRAW_REMAINING_NUMBERS_10",
     "WINNER_DEFINED",
@@ -649,7 +651,7 @@ def emit_remaining_numbers_events(conn, ctx: dict):
         sold_snapshot = _get_sold_snapshot(conn, draw_id)
         sold_numbers = int(sold_snapshot["sold"])
         remaining_numbers = max(total_numbers - sold_numbers, 0)
-        if remaining_numbers > 20:
+        if remaining_numbers > 20 and remaining_numbers != 75:
             continue
 
         occurred_at = _latest_datetime(
@@ -670,7 +672,10 @@ def emit_remaining_numbers_events(conn, ctx: dict):
             ignored_by_lookback += 1
             continue
 
-        threshold, event_key = REMAINING_THRESHOLDS[0] if remaining_numbers <= 10 else REMAINING_THRESHOLDS[1]
+        if remaining_numbers == 75:
+            threshold, event_key = REMAINING_THRESHOLDS[2]
+        else:
+            threshold, event_key = REMAINING_THRESHOLDS[0] if remaining_numbers <= 10 else REMAINING_THRESHOLDS[1]
         candidates.append({
             "event_key": event_key,
             "reference_type": "draw",
@@ -699,6 +704,7 @@ def emit_remaining_numbers_events(conn, ctx: dict):
         len(draws),
         "remaining_numbers",
         {
+            "DRAW_REMAINING_NUMBERS_75": ctx["config"]["remaining_max_events_per_scan"],
             "DRAW_REMAINING_NUMBERS_20": ctx["config"]["remaining_max_events_per_scan"],
             "DRAW_REMAINING_NUMBERS_10": ctx["config"]["remaining_max_events_per_scan"],
         },
