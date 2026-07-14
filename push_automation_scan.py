@@ -38,6 +38,12 @@ WINNER_TEMPORAL_COLUMNS = (
     "updated_at",
     "created_at",
 )
+ADDITIONAL_WINNER_TEMPORAL_COLUMNS = (
+    "realized_at",
+    "winner_defined_at",
+    "updated_at",
+    "created_at",
+)
 DRAW_TEMPORAL_COLUMNS = (
     "updated_at",
     "created_at",
@@ -63,7 +69,9 @@ def run_push_automation_scan(conn):
     print("[push-automation] scan:start", _scan_config_snapshot(config, ctx["scan_id"]))
 
     remaining_summary = emit_remaining_numbers_events(conn, ctx)
+    additional_remaining_summary = emit_additional_remaining_numbers_events(conn, ctx)
     winner_summary = emit_winner_defined_events(conn, ctx)
+    additional_winner_summary = emit_additional_winner_defined_events(conn, ctx)
     balance_summary = emit_balance_expiration_events(conn, ctx)
 
     final_summary = _final_scan_summary(ctx)
@@ -75,7 +83,9 @@ def run_push_automation_scan(conn):
         "ok": True,
         "scan_id": ctx["scan_id"],
         "remaining_numbers_checked": remaining_summary["checked"],
+        "additional_remaining_numbers_checked": additional_remaining_summary["checked"],
         "winner_checked": winner_summary["checked"],
+        "additional_winner_checked": additional_winner_summary["checked"],
         "balance_checked": balance_summary["checked"],
         "events_candidates": final_summary["events_candidates"],
         "events_attempted": final_summary["events_attempted"],
@@ -84,7 +94,9 @@ def run_push_automation_scan(conn):
         "events_sent_to_backend": final_summary["events_sent_to_backend"],
         "by_event_key": final_summary["by_event_key"],
         "remaining_numbers": remaining_summary,
+        "additional_remaining_numbers": additional_remaining_summary,
         "winner_defined": winner_summary,
+        "additional_winner_defined": additional_winner_summary,
         "balance_expiration": balance_summary,
     }
 
@@ -497,6 +509,31 @@ def _select_remaining_threshold(remaining_numbers: int) -> tuple[int, str] | Non
     return None
 
 
+def _draw_public_name(draw: dict) -> str:
+    product_name = str(draw.get("product_name") or "").strip()
+    return product_name or "Sorteio adicional New Store"
+
+
+def _additional_draw_metadata(
+    draw: dict,
+    draw_id: int,
+    extra: dict | None = None,
+) -> dict:
+    draw_type = str(draw.get("draw_type") or "adicional").strip() or "adicional"
+    public_name = _draw_public_name(draw)
+    metadata = {
+        "draw_id": draw_id,
+        "draw_type": draw_type,
+        "is_additional_draw": True,
+        "product_name": public_name,
+        "draw_name": public_name,
+        "draw_url": "/",
+    }
+    if extra:
+        metadata.update(extra)
+    return metadata
+
+
 def _notify_event(ctx: dict, candidate: dict):
     try:
         return notify_push_automation_event(
@@ -721,6 +758,103 @@ def emit_remaining_numbers_events(conn, ctx: dict):
     )
 
 
+def emit_additional_remaining_numbers_events(conn, ctx: dict):
+    draws_cols = _table_columns(conn, "draws")
+    if not {"id", "status", "draw_type"}.issubset(set(draws_cols)):
+        print("[push-automation] additional draws id/status/draw_type columns not found")
+        summary = _empty_summary()
+        _log_group_done("additional_remaining_numbers", summary)
+        return summary
+
+    draw_time_cols = _existing_columns(draws_cols, DRAW_TEMPORAL_COLUMNS)
+    optional_cols = _existing_columns(draws_cols, ("draw_type", "product_name", "product_link"))
+    selected_cols = ["id"] + optional_cols + draw_time_cols
+    order_col = _first_existing_column(draws_cols, DRAW_TEMPORAL_COLUMNS)
+    order_sql = f"{_quote_ident(order_col)} DESC NULLS LAST, id DESC" if order_col else "id DESC"
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT {', '.join(_quote_ident(column) for column in selected_cols)}
+              FROM draws
+             WHERE status IN ('open', 'active', 'aberto')
+               AND draw_type IN ('adicional', 'secundario')
+             ORDER BY {order_sql}
+        """)
+        draws = cur.fetchall() or []
+
+    if not draws:
+        summary = _empty_summary()
+        _log_group_done("additional_remaining_numbers", summary)
+        return summary
+
+    total_numbers = 100
+    candidates = []
+    ignored_by_lookback = 0
+    missing_occurred_at = 0
+
+    for draw in draws:
+        draw_id = int(draw["id"])
+        sold_snapshot = _get_sold_snapshot(conn, draw_id)
+        sold_numbers = int(sold_snapshot["sold"])
+        remaining_numbers = max(total_numbers - sold_numbers, 0)
+        selected_threshold = _select_remaining_threshold(remaining_numbers)
+        if selected_threshold is None:
+            continue
+
+        occurred_at = _latest_datetime(
+            [draw.get(column) for column in draw_time_cols]
+            + [sold_snapshot.get("activity_at")]
+        )
+        if ctx["config"]["require_occurred_at"] and occurred_at is None:
+            missing_occurred_at += 1
+            _log_missing_occurred_at(
+                "DRAW_REMAINING_NUMBERS",
+                f"additional_draw:{draw_id}:remaining",
+                "additional_draw_or_sale_temporal_column_not_found",
+            )
+            continue
+
+        lookback_hours = ctx["config"]["remaining_lookback_hours"]
+        if ctx["config"]["no_backfill"] and not _is_within_lookback(occurred_at, lookback_hours):
+            ignored_by_lookback += 1
+            continue
+
+        threshold, event_key = selected_threshold
+        candidates.append({
+            "event_key": event_key,
+            "reference_type": "additional_draw",
+            "reference_key": f"additional_draw:{draw_id}:remaining:{threshold}",
+            "occurred_at": occurred_at,
+            "metadata": _additional_draw_metadata(draw, draw_id, {
+                "threshold": threshold,
+                "remaining_numbers": remaining_numbers,
+                "total_numbers": total_numbers,
+            }),
+        })
+
+    _log_lookback_filter(
+        "DRAW_REMAINING_NUMBERS",
+        ignored_by_lookback,
+        ctx["config"]["remaining_lookback_hours"],
+        "additional_draw_or_sale_activity_outside_lookback",
+    )
+    if missing_occurred_at:
+        _record(ctx, "DRAW_REMAINING_NUMBERS", "events_skipped", missing_occurred_at)
+
+    return _process_candidates(
+        ctx,
+        candidates,
+        len(draws),
+        "additional_remaining_numbers",
+        {
+            "DRAW_REMAINING_NUMBERS_75": ctx["config"]["remaining_max_events_per_scan"],
+            "DRAW_REMAINING_NUMBERS_50": ctx["config"]["remaining_max_events_per_scan"],
+            "DRAW_REMAINING_NUMBERS_20": ctx["config"]["remaining_max_events_per_scan"],
+            "DRAW_REMAINING_NUMBERS_10": ctx["config"]["remaining_max_events_per_scan"],
+        },
+    )
+
+
 def emit_winner_defined_events(conn, ctx: dict):
     draws_cols = _table_columns(conn, "draws")
     if "id" not in draws_cols or "status" not in draws_cols:
@@ -842,6 +976,131 @@ def emit_winner_defined_events(conn, ctx: dict):
         candidates,
         candidates_count,
         "winner_defined",
+        {"WINNER_DEFINED": ctx["config"]["winner_max_events_per_scan"]},
+    )
+
+
+def emit_additional_winner_defined_events(conn, ctx: dict):
+    draws_cols = _table_columns(conn, "draws")
+    if not {"id", "draw_type"}.issubset(set(draws_cols)):
+        print("[push-automation] additional winner draws id/draw_type columns not found")
+        summary = _empty_summary()
+        _log_group_done("additional_winner_defined", summary)
+        return summary
+
+    temporal_col = _first_existing_column(draws_cols, ADDITIONAL_WINNER_TEMPORAL_COLUMNS)
+    if temporal_col is None and (ctx["config"]["no_backfill"] or ctx["config"]["require_occurred_at"]):
+        _log_missing_occurred_at(
+            "WINNER_DEFINED",
+            None,
+            "additional_winner_temporal_column_not_found",
+        )
+        summary = _empty_summary()
+        _log_group_done("additional_winner_defined", summary)
+        return summary
+
+    selected_cols = ["id", "draw_type"]
+    selected_cols += _existing_columns(draws_cols, ("winner_number", "winner_user_id", "product_name", "product_link"))
+    if temporal_col:
+        selected_cols.append(temporal_col)
+
+    winner_conditions = []
+    if "winner_number" in draws_cols:
+        winner_conditions.append("winner_number IS NOT NULL")
+    if "winner_user_id" in draws_cols:
+        winner_conditions.append("winner_user_id IS NOT NULL")
+
+    if not winner_conditions:
+        print("[push-automation] additional winner definition columns not found")
+        summary = _empty_summary()
+        _log_group_done("additional_winner_defined", summary)
+        return summary
+
+    base_where = f"draw_type IN ('adicional', 'secundario') AND ({' OR '.join(winner_conditions)})"
+    params = []
+    if ctx["config"]["no_backfill"] and temporal_col:
+        base_where += f" AND {_quote_ident(temporal_col)} >= NOW() - (%s * INTERVAL '1 hour')"
+        params.append(ctx["config"]["winner_lookback_hours"])
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT COUNT(*) AS candidates_count
+              FROM draws
+             WHERE {base_where}
+        """, tuple(params))
+        row = cur.fetchone() or {}
+        candidates_count = int(row.get("candidates_count") or 0)
+
+    if ctx["config"]["no_backfill"] and temporal_col:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT COUNT(*) AS ignored_count
+                  FROM draws
+                 WHERE draw_type IN ('adicional', 'secundario')
+                   AND ({' OR '.join(winner_conditions)})
+                   AND ({_quote_ident(temporal_col)} IS NULL
+                        OR {_quote_ident(temporal_col)} < NOW() - (%s * INTERVAL '1 hour'))
+            """, (ctx["config"]["winner_lookback_hours"],))
+            row = cur.fetchone() or {}
+            _log_lookback_filter(
+                "WINNER_DEFINED",
+                int(row.get("ignored_count") or 0),
+                ctx["config"]["winner_lookback_hours"],
+                "additional_winner_defined_outside_lookback",
+            )
+
+    block = _large_batch_block_reason(
+        ctx,
+        "WINNER_DEFINED",
+        candidates_count,
+        ctx["config"]["winner_max_events_per_scan"],
+    )
+    if block:
+        reason, max_allowed = block
+        results = _block_large_batch(
+            ctx,
+            "WINNER_DEFINED",
+            candidates_count,
+            max_allowed,
+            reason,
+        )
+        summary = _summary_from_results(candidates_count, results)
+        _log_group_done("additional_winner_defined", summary)
+        return summary
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT {', '.join(_quote_ident(column) for column in selected_cols)}
+              FROM draws
+             WHERE {base_where}
+             ORDER BY {_quote_ident(temporal_col) if temporal_col else 'id'} DESC NULLS LAST, id DESC
+        """, tuple(params))
+        draws = cur.fetchall() or []
+
+    candidates = []
+    for draw in draws:
+        draw_id = int(draw["id"])
+        winner_number = draw.get("winner_number") if "winner_number" in selected_cols else None
+        winner_user_id = draw.get("winner_user_id") if "winner_user_id" in selected_cols else None
+        extra = {}
+        if winner_number is not None:
+            extra["winner_number"] = int(winner_number)
+        if winner_user_id is not None:
+            extra["winner_user_id"] = int(winner_user_id)
+
+        candidates.append({
+            "event_key": "WINNER_DEFINED",
+            "reference_type": "additional_draw",
+            "reference_key": f"additional_draw:{draw_id}:winner_defined",
+            "occurred_at": draw.get(temporal_col) if temporal_col else None,
+            "metadata": _additional_draw_metadata(draw, draw_id, extra),
+        })
+
+    return _process_candidates(
+        ctx,
+        candidates,
+        candidates_count,
+        "additional_winner_defined",
         {"WINNER_DEFINED": ctx["config"]["winner_max_events_per_scan"]},
     )
 
