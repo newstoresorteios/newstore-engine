@@ -1,0 +1,37 @@
+name: push-automation-scan
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: newstore-push-automation-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run push automation scanner
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          PUSH_AUTOMATION_SCAN_ENABLED: "true"
+          PUSH_AUTOMATION_EVENTS_ENABLED: "true"
+          BACKEND_INTERNAL_API_BASE: ${{ secrets.BACKEND_INTERNAL_API_BASE }}
+          PUSH_INTERNAL_EVENTS_TOKEN: ${{ secrets.PUSH_INTERNAL_EVENTS_TOKEN }}
+        run: python run_push_automation_scan.py

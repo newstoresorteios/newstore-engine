@@ -490,6 +490,13 @@ def _get_sold_snapshot(conn, draw_id: int) -> dict:
     }
 
 
+def _select_remaining_threshold(remaining_numbers: int) -> tuple[int, str] | None:
+    for threshold, event_key in REMAINING_THRESHOLDS:
+        if remaining_numbers <= threshold:
+            return threshold, event_key
+    return None
+
+
 def _notify_event(ctx: dict, candidate: dict):
     try:
         return notify_push_automation_event(
@@ -655,7 +662,8 @@ def emit_remaining_numbers_events(conn, ctx: dict):
         sold_snapshot = _get_sold_snapshot(conn, draw_id)
         sold_numbers = int(sold_snapshot["sold"])
         remaining_numbers = max(total_numbers - sold_numbers, 0)
-        if remaining_numbers > 20 and remaining_numbers not in (50, 75):
+        selected_threshold = _select_remaining_threshold(remaining_numbers)
+        if selected_threshold is None:
             continue
 
         occurred_at = _latest_datetime(
@@ -676,12 +684,7 @@ def emit_remaining_numbers_events(conn, ctx: dict):
             ignored_by_lookback += 1
             continue
 
-        if remaining_numbers == 75:
-            threshold, event_key = 75, "DRAW_REMAINING_NUMBERS_75"
-        elif remaining_numbers == 50:
-            threshold, event_key = 50, "DRAW_REMAINING_NUMBERS_50"
-        else:
-            threshold, event_key = REMAINING_THRESHOLDS[0] if remaining_numbers <= 10 else REMAINING_THRESHOLDS[1]
+        threshold, event_key = selected_threshold
         candidates.append({
             "event_key": event_key,
             "reference_type": "draw",
