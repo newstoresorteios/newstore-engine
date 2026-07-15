@@ -4,8 +4,8 @@ from email.message import EmailMessage
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
-from datetime import datetime, timezone, timedelta
-from push_automation_events import notify_new_draw_published, notify_push_automation_event
+from datetime import date, datetime, timezone
+from push_automation_events import notify_push_automation_event
 from push_automation_scan import run_push_automation_scan
 
 # >>> utilidades para limpar a URL do Postgres e mascarar senha nos logs
@@ -130,18 +130,26 @@ def db():
 
 def get_pending_draws(conn):
     """
-    Retorna:
-      - o sorteio principal 'closed' mais recente com realized_at IS NULL.
+    Retorna todos os sorteios fechados ainda sem resultado, em ordem de fechamento.
+    draw_type nulo continua sendo tratado como principal legado.
     """
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT id, status, opened_at
-              FROM draws
-             WHERE status = 'closed'
-               AND realized_at IS NULL
-               AND COALESCE(draw_type, 'principal') = 'principal'
-             ORDER BY id DESC
-             LIMIT 1
+            SELECT d.id,
+                   d.status,
+                   d.opened_at,
+                   d.closed_at,
+                   COALESCE(d.draw_type, 'principal') AS draw_type,
+                   NULLIF(BTRIM(to_jsonb(d)->>'product_name'), '') AS product_name
+              FROM draws d
+             WHERE d.status = 'closed'
+               AND d.realized_at IS NULL
+               AND COALESCE(d.draw_type, 'principal') IN (
+                   'principal',
+                   'adicional',
+                   'secundario'
+               )
+             ORDER BY d.closed_at ASC NULLS LAST, d.id ASC
         """)
         return cur.fetchall() or []
 
@@ -259,11 +267,13 @@ def set_draw_sorteado(conn, draw_id: int, winner_number: int, winner_user_id):
 
 def set_draw_sorteado_any_status(conn, draw_id: int, winner_number: int, winner_user_id, winner_name):
     """
-    Finaliza independente do status atual (open/closed):
+    Finaliza somente um sorteio que continua fechado e ainda não foi realizado:
       - status='sorteado'
       - winner_number / winner_user_id / winner_name
       - closed_at = COALESCE(closed_at, NOW())
       - realized_at = NOW()
+
+    Retorna a quantidade de linhas atualizadas para impedir comunicação duplicada.
     """
     with conn.cursor() as cur:
         cur.execute("""
@@ -275,7 +285,10 @@ def set_draw_sorteado_any_status(conn, draw_id: int, winner_number: int, winner_
                    closed_at = COALESCE(closed_at, NOW()),
                    realized_at = NOW()
              WHERE id = %s
+               AND status = 'closed'
+               AND realized_at IS NULL
         """, (winner_number, winner_user_id, winner_name, draw_id))
+        return cur.rowcount
 
 def open_new_draw(conn):
     """Abre um novo sorteio 'open'. Ajuste os campos se sua tabela exigir mais colunas."""
@@ -425,17 +438,62 @@ def get_participants(conn, draw_id: int):
         return cur.fetchall() or []
 
 # --------- Loto helper ---------
-def get_last_lotomania_number():
-    # espera JSON com lista de dezenas; usamos APENAS o ÚLTIMO número sorteado
+def _parse_lotomania_result_date(value):
+    """Converte somente formatos de data conhecidos, sem inventar horário."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def get_last_lotomania_result():
+    # Espera JSON com lista de dezenas; usamos APENAS o ÚLTIMO número sorteado.
     r = requests.get(LOT_ENDPOINT, timeout=20, headers={"Accept": "application/json"})
     r.raise_for_status()
     j = r.json()
+    if not isinstance(j, dict):
+        raise RuntimeError("Payload inválido da Lotomania")
+
     dezenas = j.get("listaDezenas") or j.get("dezenas") or []
-    if not dezenas:
+    if not isinstance(dezenas, (list, tuple)) or not dezenas:
         raise RuntimeError("Sem dezenas no payload da Lotomania")
-    ultimo = int(str(dezenas[-1]).lstrip("0") or "0")  # "07" -> 7
-    print(f"[lotomania] Último número sorteado: {ultimo}")
-    return ultimo
+
+    try:
+        ultimo = int(str(dezenas[-1]).strip().lstrip("0") or "0")  # "07" -> 7
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Última dezena inválida no payload da Lotomania") from exc
+    if ultimo < 0 or ultimo > 99:
+        raise RuntimeError("Última dezena fora do intervalo 00-99")
+
+    contest_number = j.get("numero")
+    try:
+        contest_number = int(contest_number) if contest_number is not None else None
+    except (TypeError, ValueError):
+        contest_number = None
+
+    return {
+        "winner_number": ultimo,
+        "contest_number": contest_number,
+        "result_date": _parse_lotomania_result_date(j.get("dataApuracao")),
+    }
+
+
+def get_last_lotomania_number():
+    """Compatibilidade para consumidores antigos."""
+    return get_last_lotomania_result()["winner_number"]
 
 # --------- Push automation scanner ---------
 def _run_push_automation_scan_safely(conn):
@@ -448,159 +506,271 @@ def _run_push_automation_scan_safely(conn):
         print("[push-automation] scan failed:", exc)
 
 # --------- Main ---------
+def _normalize_result_draw_type(value):
+    draw_type = str(value or "principal").strip().lower()
+    return "adicional" if draw_type in ("adicional", "secundario") else "principal"
+
+
+def _result_before_draw_close(lotomania_result: dict, draw: dict) -> bool:
+    result_date = lotomania_result.get("result_date")
+    closed_at = draw.get("closed_at")
+    if not isinstance(result_date, date) or not isinstance(closed_at, (date, datetime)):
+        return False
+    closed_date = closed_at.date() if isinstance(closed_at, datetime) else closed_at
+    return result_date < closed_date
+
+
+def _winner_defined_event(draw: dict, winner_number: int, winner_user_id, winner_name):
+    draw_id = int(draw["id"])
+    draw_type = _normalize_result_draw_type(draw.get("draw_type"))
+    is_additional = draw_type == "adicional"
+    metadata = {
+        "draw_id": draw_id,
+        "draw_type": draw_type,
+        "winner_number": winner_number,
+        "winner_user_id": winner_user_id,
+        "winner_name": winner_name,
+        "is_additional_draw": is_additional,
+    }
+    product_name = str(draw.get("product_name") or "").strip()
+    if product_name:
+        metadata["product_name"] = product_name
+    return {
+        "event_key": "WINNER_DEFINED",
+        "reference_type": "additional_draw" if is_additional else "draw",
+        "reference_key": (
+            f"additional_draw:{draw_id}:winner_defined"
+            if is_additional
+            else f"draw:{draw_id}:winner_defined"
+        ),
+        "metadata": metadata,
+    }
+
+
+def _send_result_communications(
+    draw: dict,
+    draw_label: str,
+    winner_number: int,
+    winner_user_id,
+    winner_name,
+    winner_email,
+    loser_list,
+):
+    winner_event = _winner_defined_event(
+        draw,
+        winner_number,
+        winner_user_id,
+        winner_name,
+    )
+    try:
+        response = notify_push_automation_event(**winner_event)
+        if isinstance(response, dict) and response.get("ok") is False:
+            print("[push-automation] winner_defined not sent:", {
+                "reference_key": winner_event["reference_key"],
+                "reason": response.get("reason"),
+                "status": response.get("status"),
+            })
+    except Exception as event_exc:
+        print("[push-automation] winner_defined failed after commit:", {
+            "reference_key": winner_event["reference_key"],
+            "message": str(event_exc) or "event_failed",
+        })
+
+    if winner_user_id and winner_email:
+        try:
+            send_winner_email(
+                winner_email,
+                winner_name or "Participante",
+                draw_label,
+                int(draw["id"]),
+                winner_number,
+            )
+        except Exception as email_exc:
+            print("[email] erro apos commit:", repr(email_exc))
+    elif winner_user_id:
+        print(f"[email] usuário {winner_user_id} sem e-mail; não foi possível notificar vencedor.")
+
+    try:
+        send_draw_closed_admin(
+            draw_label,
+            int(draw["id"]),
+            winner_number,
+            winner_name,
+            winner_email,
+        )
+    except Exception as email_exc:
+        print("[email] erro apos commit:", repr(email_exc))
+
+    print(f"[draw {draw['id']}] enviando e-mail de 'não contemplado' para {len(loser_list)} participantes")
+    for participant in loser_list:
+        if not participant.get("email"):
+            continue
+        try:
+            send_loser_email(
+                participant["email"],
+                participant.get("name") or "Participante",
+                draw_label,
+                int(draw["id"]),
+                winner_number,
+                winner_name or "-",
+            )
+        except Exception as email_exc:
+            print("[email] erro apos commit:", repr(email_exc))
+
+
+def _process_pending_draw(conn, draw: dict, lotomania_result: dict) -> bool:
+    draw_id = int(draw["id"])
+    draw_type = _normalize_result_draw_type(draw.get("draw_type"))
+    winner_number = int(lotomania_result["winner_number"])
+    contest_number = lotomania_result.get("contest_number")
+    result_date = lotomania_result.get("result_date")
+    print("[result] processing_draw", {
+        "draw_id": draw_id,
+        "draw_type": draw_type,
+        "winner_number": winner_number,
+        "contest_number": contest_number,
+        "result_at": result_date.isoformat() if isinstance(result_date, date) else None,
+        "status": draw.get("status"),
+    })
+
+    if _result_before_draw_close(lotomania_result, draw):
+        print("[result] result_before_draw_close", {
+            "draw_id": draw_id,
+            "draw_type": draw_type,
+            "contest_number": contest_number,
+            "result_at": result_date.isoformat(),
+            "closed_at": draw["closed_at"].isoformat(),
+        })
+        return False
+
+    product_name = str(draw.get("product_name") or "").strip()
+    draw_label = product_name or get_draw_label(conn, draw_id)
+    winner_user_id, winner_name, winner_email = winner_for_number(
+        conn,
+        draw_id,
+        winner_number,
+    )
+    if winner_user_id is None:
+        print("[result] draw_without_buyer", {
+            "draw_id": draw_id,
+            "draw_type": draw_type,
+            "winner_number": winner_number,
+        })
+
+    updated_count = set_draw_sorteado_any_status(
+        conn,
+        draw_id,
+        winner_number,
+        winner_user_id,
+        winner_name,
+    )
+    if updated_count != 1:
+        conn.rollback()
+        print("[result] already_processed_or_changed", {
+            "draw_id": draw_id,
+            "draw_type": draw_type,
+            "status": draw.get("status"),
+        })
+        return False
+
+    if not COMMIT:
+        conn.rollback()
+        print("[result] draw_skipped", {
+            "draw_id": draw_id,
+            "draw_type": draw_type,
+            "reason": "dry_run",
+        })
+        return True
+
+    conn.commit()
+    print("[result] draw_processed", {
+        "draw_id": draw_id,
+        "draw_type": draw_type,
+        "winner_number": winner_number,
+        "winner_user_id": winner_user_id,
+        "status": "sorteado",
+    })
+    try:
+        participants = get_participants(conn, draw_id)
+        loser_list = [
+            participant
+            for participant in participants
+            if participant["id"] != (winner_user_id or -1)
+        ]
+    except Exception as participant_exc:
+        loser_list = []
+        print("[email] participantes indisponíveis após commit:", {
+            "draw_id": draw_id,
+            "reason": str(participant_exc) or participant_exc.__class__.__name__,
+        })
+    finally:
+        try:
+            conn.rollback()  # encerra apenas a transação de leitura pós-commit
+        except Exception:
+            pass
+    _send_result_communications(
+        draw,
+        draw_label,
+        winner_number,
+        winner_user_id,
+        winner_name,
+        winner_email,
+        loser_list,
+    )
+    return True
+
+
 def run():
     print("[run] iniciando", datetime.now(timezone.utc).isoformat())
     conn = db()
     try:
         draws = get_pending_draws(conn)
-        print(f"[run] sorteios pendentes: {[{'id': d['id'], 'status': d['status']} for d in draws]}")
+        print("[result] pending_draws_found", {
+            "count": len(draws),
+            "draw_ids": [int(draw["id"]) for draw in draws],
+        })
         if not draws:
             _run_push_automation_scan_safely(conn)
             return 0
 
-        total_slots = _get_total_slots_from_config(conn)
-        print(f"[run] total_slots (capacidade): {total_slots}")
-
-        last_number = get_last_lotomania_number()
-        new_draw_ids = []
-        email_notifications = []
-        winner_defined_events = []
-
-        for d in draws:
-            draw_id = d["id"]
-            status = d["status"]
-            draw_label = get_draw_label(conn, draw_id)
-            opened_at = d.get("opened_at")
-            age_days = None
-            if opened_at:
-                # opened_at já vem com tz? assume naive->utc igual
-                age_days = (datetime.now(timezone.utc) - opened_at.replace(tzinfo=timezone.utc)).days
-            print(f"[draw {draw_id}] status={status} label='{draw_label}' age_days={age_days}")
-
-            finalize_now = False
-            open_will_be_finalized = False
-
-            if status == "closed":
-                # Já fechado, mas sem realized_at: finalize e comunique agora
-                finalize_now = True
-            else:
-                sold = get_sold_count(conn, draw_id)
-                sold_out = sold >= total_slots
-                print(f"[draw {draw_id}] vendidos={sold} / {total_slots} -> sold_out={sold_out}")
-
-                # Regra:
-                # - NÃO fecha se não vendeu tudo e < 7 dias
-                # - Fecha se sold_out OU >= 7 dias
-                finalize_now = sold_out or (age_days is not None and age_days >= 7)
-                open_will_be_finalized = finalize_now
-
-            if not finalize_now:
-                print(f"[draw {draw_id}] NÃO será finalizado agora.")
-                continue
-
-            # Determina vencedor pelo último número da Lotomania
-            winner_user_id, winner_name, winner_email = winner_for_number(conn, draw_id, last_number)
-
-            # Marca sorteado (funciona para open/closed) — agora persiste também winner_name
-            set_draw_sorteado_any_status(conn, draw_id, last_number, winner_user_id, winner_name)
-
-            winner_metadata = {
-                "draw_id": draw_id,
-                "winner_number": last_number,
-            }
-            if winner_user_id is not None:
-                winner_metadata["winner_user_id"] = winner_user_id
-            if winner_name:
-                winner_metadata["winner_name"] = winner_name
-            winner_defined_events.append({
-                "event_key": "WINNER_DEFINED",
-                "reference_type": "draw",
-                "reference_key": f"draw:{draw_id}:winner_defined",
-                "metadata": winner_metadata,
-            })
-            # E-mail para vencedor (se houver) - enfileirado para envio apos commit
-            if winner_user_id and winner_email:
-                email_notifications.append((
-                    "winner",
-                    (winner_email, winner_name or "Participante", draw_label, draw_id, last_number),
-                ))
-            elif winner_user_id and not winner_email:
-                print(f"[email] usuário {winner_user_id} sem e-mail; não foi possível notificar vencedor.")
-
-            # Admin sempre recebe (com nome/numero do vencedor quando houver)
-            email_notifications.append((
-                "admin",
-                (draw_label, draw_id, last_number, winner_name, winner_email),
-            ))
-
-            # Participantes não contemplados (com info do vencedor)
-            parts = get_participants(conn, draw_id)
-            loser_list = [p for p in parts if p["id"] != (winner_user_id or -1)]
-            email_notifications.append(("loser_count", (draw_id, len(loser_list))))
-            for p in loser_list:
-                if p.get("email"):
-                    email_notifications.append((
-                        "loser",
-                        (
-                            p["email"],
-                            p.get("name") or "Participante",
-                            draw_label,
-                            draw_id,
-                            last_number,
-                            winner_name or "-",
-                        ),
-                    ))
-            # Abre novo sorteio apenas quando finalizamos um 'open' agora
-            if open_will_be_finalized:
-                new_draw_id = open_new_draw(conn)
-                new_draw_ids.append(new_draw_id)
-
-        if COMMIT:
-            conn.commit()
-            print("[run] COMMIT aplicado.")
-            for winner_event in winner_defined_events:
-                try:
-                    response = notify_push_automation_event(**winner_event)
-                    if isinstance(response, dict) and response.get("ok") is False:
-                        print("[push-automation] winner_defined not sent:", {
-                            "reference_key": winner_event.get("reference_key"),
-                            "reason": response.get("reason"),
-                            "status": response.get("status"),
-                        })
-                except Exception as event_exc:
-                    print("[push-automation] winner_defined failed after commit:", {
-                        "reference_key": winner_event.get("reference_key"),
-                        "message": str(event_exc) or "event_failed",
-                    })
-            for email_kind, email_args in email_notifications:
-                try:
-                    if email_kind == "winner":
-                        send_winner_email(*email_args)
-                    elif email_kind == "admin":
-                        send_draw_closed_admin(*email_args)
-                    elif email_kind == "loser_count":
-                        queued_draw_id, queued_count = email_args
-                        print(f"[draw {queued_draw_id}] enviando e-mail de 'não contemplado' para {queued_count} participantes")
-                    elif email_kind == "loser":
-                        send_loser_email(*email_args)
-                except Exception as email_exc:
-                    print("[email] erro apos commit:", repr(email_exc))
-            for new_draw_id in new_draw_ids:
-                notify_new_draw_published(
-                    new_draw_id,
-                    metadata={"draw_id": new_draw_id},
-                )
-        else:
+        try:
+            lotomania_result = get_last_lotomania_result()
+        except Exception as api_exc:
             conn.rollback()
-            print("[run] DRY-RUN (rollback).")
+            print("[result] api_result_unavailable", {
+                "reason": str(api_exc) or api_exc.__class__.__name__,
+            })
+            _run_push_automation_scan_safely(conn)
+            return 1
+
+        result_date = lotomania_result.get("result_date")
+        print("[result] lotomania_result_loaded", {
+            "winner_number": lotomania_result["winner_number"],
+            "contest_number": lotomania_result.get("contest_number"),
+            "result_at": result_date.isoformat() if isinstance(result_date, date) else None,
+        })
+
+        for draw in draws:
+            try:
+                _process_pending_draw(conn, draw, lotomania_result)
+            except Exception as draw_exc:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                print("[result] draw_skipped", {
+                    "draw_id": draw.get("id"),
+                    "draw_type": _normalize_result_draw_type(draw.get("draw_type")),
+                    "reason": str(draw_exc) or draw_exc.__class__.__name__,
+                })
 
         _run_push_automation_scan_safely(conn)
         return 0
-    except Exception as e:
-        print("[run] erro:", repr(e))
+    except Exception as exc:
+        print("[run] erro:", repr(exc))
         try:
             conn.rollback()
-        except:
+        except Exception:
             pass
         return 1
     finally:
