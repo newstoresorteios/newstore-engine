@@ -35,3 +35,11 @@ jobs:
           BACKEND_INTERNAL_API_BASE: ${{ secrets.BACKEND_INTERNAL_API_BASE }}
           PUSH_INTERNAL_EVENTS_TOKEN: ${{ secrets.PUSH_INTERNAL_EVENTS_TOKEN }}
         run: python run_push_automation_scan.py
+
+      - name: Run email automation scanner
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          EMAIL_AUTOMATION_SCAN_ENABLED: "true"
+          BACKEND_INTERNAL_API_BASE: ${{ secrets.BACKEND_INTERNAL_API_BASE }}
+          PUSH_INTERNAL_EVENTS_TOKEN: ${{ secrets.PUSH_INTERNAL_EVENTS_TOKEN }}
+        run: python run_email_automation_scan.py
