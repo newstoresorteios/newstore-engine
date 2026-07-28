@@ -13,6 +13,7 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 8
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,11 +30,14 @@ jobs:
 
       - name: Run email automation scanner
         env:
-          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          POSTGRES_URL: "postgres://postgres.mgwvavsjxzwflibcjzhd:CtPrJ5nOpomcjuJV@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require"
+
           EMAIL_AUTOMATION_SCAN_ENABLED: "true"
           EMAIL_AUTOMATION_DEFAULT_LOOKBACK_HOURS: "24"
           EMAIL_AUTOMATION_PUBLISHED_LOOKBACK_HOURS: "24"
           EMAIL_AUTOMATION_CLOSED_LOOKBACK_HOURS: "72"
-          BACKEND_INTERNAL_API_BASE: ${{ secrets.BACKEND_INTERNAL_API_BASE }}
-          PUSH_INTERNAL_EVENTS_TOKEN: ${{ secrets.PUSH_INTERNAL_EVENTS_TOKEN }}
+
+          BACKEND_INTERNAL_API_BASE: "https://newstore-backend.onrender.com"
+          PUSH_INTERNAL_EVENTS_TOKEN: "f60d817e28fac4ddf3ca391adb338d775a182ac9f2fa492a00540ddd769e2a52"
+
         run: python run_email_automation_scan.py
