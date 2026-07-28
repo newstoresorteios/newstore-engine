@@ -8,6 +8,7 @@ EMAIL_EVENTS_PATH = "/api/internal/email/events"
 MAX_ATTEMPTS = 3
 RETRY_DELAYS_SECONDS = (1, 3)
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+DEDUPE_STATUS_CODES = {409}
 
 
 def notify_email_automation_event(
@@ -43,7 +44,17 @@ def notify_email_automation_event(
                 headers={"x-internal-token": internal_token},
                 timeout=15,
             )
-            data = response.json() if response.content else None
+            try:
+                data = response.json()
+            except ValueError:
+                data = None
+            if response.status_code in DEDUPE_STATUS_CODES:
+                return {
+                    "ok": True,
+                    "status": response.status_code,
+                    "deduped": True,
+                    "data": data,
+                }
             if response.ok:
                 return {"ok": True, "status": response.status_code, "data": data}
             if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_ATTEMPTS:

@@ -11,6 +11,9 @@ EMAIL_REMAINING_THRESHOLDS = (
     (50, "EMAIL_DRAW_REMAINING_50"),
     (75, "EMAIL_DRAW_REMAINING_75"),
 )
+EMAIL_DEFAULT_LOOKBACK_HOURS = 24
+EMAIL_PUBLISHED_LOOKBACK_HOURS = 24
+EMAIL_CLOSED_LOOKBACK_HOURS = 72
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -36,12 +39,36 @@ def _remaining_threshold(remaining: int):
     return None
 
 
+def _load_published_draws(conn, lookback_hours: int):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, status, COALESCE(draw_type, 'principal') AS draw_type,
+                   product_name, opened_at
+              FROM public.draws
+             WHERE opened_at IS NOT NULL
+               AND opened_at >= NOW() - (%s * INTERVAL '1 hour')
+               AND status IN ('open', 'closed', 'sorteado')
+               AND COALESCE(draw_type, 'principal') IN (
+                   'principal',
+                   'adicional',
+                   'secundario'
+               )
+             ORDER BY id
+        """, (lookback_hours,))
+        return cur.fetchall() or []
+
+
 def _load_open_draws(conn):
     with conn.cursor() as cur:
         cur.execute("""
             SELECT id, COALESCE(draw_type, 'principal') AS draw_type, product_name
               FROM public.draws
              WHERE status = 'open'
+               AND COALESCE(draw_type, 'principal') IN (
+                   'principal',
+                   'adicional',
+                   'secundario'
+               )
              ORDER BY id
         """)
         return cur.fetchall() or []
@@ -62,31 +89,131 @@ def _load_numbers_snapshot(conn, draw_id: int) -> dict:
 def _load_closed_draws(conn, lookback_hours: int):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT id, COALESCE(draw_type, 'principal') AS draw_type,
+            SELECT id, status, COALESCE(draw_type, 'principal') AS draw_type,
                    product_name, closed_at
               FROM public.draws
-             WHERE status = 'closed'
+             WHERE closed_at IS NOT NULL
                AND closed_at >= NOW() - (%s * INTERVAL '1 hour')
+               AND status IN ('closed', 'sorteado')
+               AND COALESCE(draw_type, 'principal') IN (
+                   'principal',
+                   'adicional',
+                   'secundario'
+               )
              ORDER BY id
         """, (lookback_hours,))
         return cur.fetchall() or []
 
 
-def _emit(event_key, reference_type, reference_key, metadata, scan_id):
-    return notify_email_automation_event(
-        event_key=event_key,
-        reference_type=reference_type,
-        reference_key=reference_key,
-        metadata=metadata,
-        scan_id=scan_id,
-        occurred_at=datetime.now(timezone.utc).isoformat(),
+def _iso_datetime(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def _emit(event_key, reference_type, reference_key, metadata, scan_id, occurred_at=None):
+    try:
+        return notify_email_automation_event(
+            event_key=event_key,
+            reference_type=reference_type,
+            reference_key=reference_key,
+            metadata=metadata,
+            scan_id=scan_id,
+            occurred_at=(
+                _iso_datetime(occurred_at)
+                if occurred_at is not None
+                else datetime.now(timezone.utc).isoformat()
+            ),
+        )
+    except Exception as exc:
+        print("[email-automation] event_failed", {
+            "event_key": event_key,
+            "reference_key": reference_key,
+            "error_type": exc.__class__.__name__,
+        })
+        return {"ok": False, "reason": "backend_request_failed"}
+
+
+def _nonnegative_count(value) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _delivery_counts(result):
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return {"sent": 0, "failed": 1, "skipped": 0}
+
+    backend_result = result.get("data")
+    if not isinstance(backend_result, dict):
+        backend_result = result
+    sent = _nonnegative_count(backend_result.get("sent"))
+    failed = _nonnegative_count(backend_result.get("failed"))
+    skipped = _nonnegative_count(
+        backend_result.get("skipped", backend_result.get("deduped"))
     )
+    if result.get("deduped") and skipped == 0:
+        skipped = 1
+    if backend_result.get("status") == "skipped" and skipped == 0:
+        skipped = 1
+    return {"sent": sent, "failed": failed, "skipped": skipped}
+
+
+def _add_delivery_counts(summary, result):
+    counts = _delivery_counts(result)
+    for key in ("sent", "failed", "skipped"):
+        summary[key] += counts[key]
+
+
+def _record_event(summary, event_key, result):
+    summary["events"] += 1
+    summary["by_event_key"][event_key] = (
+        summary["by_event_key"].get(event_key, 0) + 1
+    )
+    _add_delivery_counts(summary, result)
 
 
 def run_email_automation_scan(conn):
     scan_id = _scan_id()
-    lookback_hours = _env_int("EMAIL_AUTOMATION_DEFAULT_LOOKBACK_HOURS", 24)
-    summary = {"ok": True, "scan_id": scan_id, "remaining_checked": 0, "closed_checked": 0, "events": 0, "sent": 0, "failed": 0, "by_event_key": {}}
+    default_lookback_hours = _env_int(
+        "EMAIL_AUTOMATION_DEFAULT_LOOKBACK_HOURS",
+        EMAIL_DEFAULT_LOOKBACK_HOURS,
+    )
+    published_lookback_hours = _env_int(
+        "EMAIL_AUTOMATION_PUBLISHED_LOOKBACK_HOURS",
+        default_lookback_hours,
+    )
+    closed_lookback_hours = _env_int(
+        "EMAIL_AUTOMATION_CLOSED_LOOKBACK_HOURS",
+        EMAIL_CLOSED_LOOKBACK_HOURS,
+    )
+    summary = {
+        "ok": True,
+        "scan_id": scan_id,
+        "published_checked": 0,
+        "remaining_checked": 0,
+        "closed_checked": 0,
+        "events": 0,
+        "sent": 0,
+        "failed": 0,
+        "skipped": 0,
+        "by_event_key": {},
+    }
+
+    for draw in _load_published_draws(conn, published_lookback_hours):
+        draw_id = int(draw["id"])
+        group = _draw_group(draw.get("draw_type"))
+        event_key = "NEW_DRAW_PUBLISHED"
+        reference_type = "draw" if group == "draw" else "additional_draw"
+        reference_key = f"{group}:{draw_id}:published_email"
+        opened_at = draw.get("opened_at")
+        result = _emit(event_key, reference_type, reference_key, {
+            "draw_id": draw_id,
+            "draw_type": draw.get("draw_type") or "principal",
+            "opened_at": _iso_datetime(opened_at),
+            "product_name": draw.get("product_name") or None,
+        }, scan_id, occurred_at=opened_at)
+        summary["published_checked"] += 1
+        _record_event(summary, event_key, result)
 
     for draw in _load_open_draws(conn):
         draw_id = int(draw["id"])
@@ -106,25 +233,21 @@ def run_email_automation_scan(conn):
             "threshold": threshold,
             "product_name": draw.get("product_name") or None,
         }, scan_id)
-        summary["events"] += 1
-        summary["by_event_key"][event_key] = summary["by_event_key"].get(event_key, 0) + 1
-        summary["sent"] += int(bool(result.get("ok")))
-        summary["failed"] += int(not result.get("ok"))
+        _record_event(summary, event_key, result)
 
-    for draw in _load_closed_draws(conn, lookback_hours):
+    for draw in _load_closed_draws(conn, closed_lookback_hours):
         draw_id = int(draw["id"])
         group = _draw_group(draw.get("draw_type"))
         event_key = "DRAW_CLOSED"
         reference_key = f"{group}:{draw_id}:closed_email"
+        closed_at = draw.get("closed_at")
         result = _emit(event_key, "draw" if group == "draw" else "additional_draw", reference_key, {
             "draw_id": draw_id,
             "draw_type": draw.get("draw_type") or "principal",
-            "closed_at": draw.get("closed_at").isoformat() if hasattr(draw.get("closed_at"), "isoformat") else draw.get("closed_at"),
+            "closed_at": _iso_datetime(closed_at),
             "product_name": draw.get("product_name") or None,
-        }, scan_id)
+        }, scan_id, occurred_at=closed_at)
         summary["closed_checked"] += 1
-        summary["events"] += 1
-        summary["by_event_key"][event_key] = summary["by_event_key"].get(event_key, 0) + 1
-        summary["sent"] += int(bool(result.get("ok")))
-        summary["failed"] += int(not result.get("ok"))
+        _record_event(summary, event_key, result)
+    summary["ok"] = summary["failed"] == 0
     return summary

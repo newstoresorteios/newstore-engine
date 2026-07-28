@@ -52,6 +52,23 @@ Use `PUSH_AUTOMATION_PREVIEW_ONLY=true` para validar candidatos sem chamar o bac
 
 Balance automation usa `users.coupon_value_cents` como saldo, `users.coupon_updated_at` como base temporal e calcula o vencimento com `TRAY_COUPON_VALID_DAYS`.
 
+### Email Automation
+
+O scanner de e-mail roda separadamente do scanner de push. A engine detecta
+publicacao, thresholds de numeros restantes e fechamento de sorteios principais
+e adicionais, e chama o endpoint interno de e-mail do backend. Deduplicacao e
+SMTP permanecem no backend.
+
+```env
+EMAIL_AUTOMATION_SCAN_ENABLED=true
+EMAIL_AUTOMATION_DEFAULT_LOOKBACK_HOURS=24
+EMAIL_AUTOMATION_PUBLISHED_LOOKBACK_HOURS=24
+EMAIL_AUTOMATION_CLOSED_LOOKBACK_HOURS=72
+```
+
+O workflow dedicado `.github/workflows/email-automation-scan.yml` reutiliza
+`POSTGRES_URL`, `BACKEND_INTERNAL_API_BASE` e `PUSH_INTERNAL_EVENTS_TOKEN`.
+
 ## Local
 ```bash
 python -m venv .venv && . .venv/bin/activate
