@@ -1,0 +1,45 @@
+
+
+name: email-automation-scan
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: newstore-email-automation-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run email automation scanner
+        env:
+          POSTGRES_URL: ${{ postgres://postgres.mgwvavsjxzwflibcjzhd:CtPrJ5nOpomcjuJV@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require }}
+
+          EMAIL_AUTOMATION_SCAN_ENABLED: "true"
+          EMAIL_AUTOMATION_DEFAULT_LOOKBACK_HOURS: "24"
+          EMAIL_AUTOMATION_PUBLISHED_LOOKBACK_HOURS: "24"
+          EMAIL_AUTOMATION_CLOSED_LOOKBACK_HOURS: "72"
+
+          BACKEND_INTERNAL_API_BASE: ${{ https://newstore-backend.onrender.com }}
+          PUSH_INTERNAL_EVENTS_TOKEN: ${{ f60d817e28fac4ddf3ca391adb338d775a182ac9f2fa492a00540ddd769e2a52 }}
+
+        run: python run_email_automation_scan.py
