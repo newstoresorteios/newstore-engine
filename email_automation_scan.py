@@ -47,7 +47,7 @@ def _load_published_draws(conn, lookback_hours: int):
               FROM public.draws
              WHERE opened_at IS NOT NULL
                AND opened_at >= NOW() - (%s * INTERVAL '1 hour')
-               AND status IN ('open', 'closed', 'sorteado')
+               AND status = 'open'
                AND COALESCE(draw_type, 'principal') IN (
                    'principal',
                    'adicional',
@@ -111,7 +111,7 @@ def _iso_datetime(value):
 
 def _emit(event_key, reference_type, reference_key, metadata, scan_id, occurred_at=None):
     try:
-        return notify_email_automation_event(
+        result = notify_email_automation_event(
             event_key=event_key,
             reference_type=reference_type,
             reference_key=reference_key,
@@ -124,12 +124,24 @@ def _emit(event_key, reference_type, reference_key, metadata, scan_id, occurred_
             ),
         )
     except Exception as exc:
+        result = {
+            "ok": False,
+            "reason": "backend_request_failed",
+            "error_type": exc.__class__.__name__,
+        }
+
+    if not isinstance(result, dict) or result.get("ok") is not True:
         print("[email-automation] event_failed", {
             "event_key": event_key,
             "reference_key": reference_key,
-            "error_type": exc.__class__.__name__,
+            "status": result.get("status") if isinstance(result, dict) else None,
+            "reason": (
+                result.get("reason") or "backend_event_failed"
+                if isinstance(result, dict)
+                else "backend_event_failed"
+            ),
         })
-        return {"ok": False, "reason": "backend_request_failed"}
+    return result
 
 
 def _nonnegative_count(value) -> int:
@@ -140,18 +152,23 @@ def _nonnegative_count(value) -> int:
 
 
 def _delivery_counts(result):
-    if not isinstance(result, dict) or result.get("ok") is not True:
-        return {"sent": 0, "failed": 1, "skipped": 0}
-
-    backend_result = result.get("data")
+    result_is_dict = isinstance(result, dict)
+    result_dict = result if result_is_dict else {}
+    backend_result = result_dict.get("data")
     if not isinstance(backend_result, dict):
-        backend_result = result
+        backend_result = result_dict
     sent = _nonnegative_count(backend_result.get("sent"))
     failed = _nonnegative_count(backend_result.get("failed"))
     skipped = _nonnegative_count(
         backend_result.get("skipped", backend_result.get("deduped"))
     )
-    if result.get("deduped") and skipped == 0:
+    if (
+        not result_is_dict
+        or result_dict.get("ok") is not True
+        or backend_result.get("ok") is False
+    ):
+        failed = max(failed, 1)
+    if result_dict.get("deduped") and skipped == 0:
         skipped = 1
     if backend_result.get("status") == "skipped" and skipped == 0:
         skipped = 1

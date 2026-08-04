@@ -116,7 +116,7 @@ class EmailAutomationScanTest(unittest.TestCase):
         opened_at = datetime.now(timezone.utc)
         conn = FakeConnection(published_draws=[{
             "id": 133,
-            "status": "sorteado",
+            "status": "open",
             "draw_type": "principal",
             "product_name": "Principal",
             "opened_at": opened_at,
@@ -264,6 +264,7 @@ class EmailAutomationScanTest(unittest.TestCase):
         self.assertEqual(notify.call_args.kwargs["reference_key"], "draw:133:closed_email")
         self.assertEqual(summary["sent"], 1)
         closed_sql = next(sql for sql, _params in conn.executions if "closed_at IS NOT NULL" in sql)
+        self.assertIn("closed_at IS NOT NULL", closed_sql)
         self.assertNotIn("status = 'closed'", closed_sql)
         self.assertIn("status IN ('closed', 'sorteado')", closed_sql)
 
@@ -326,6 +327,37 @@ class EmailAutomationScanTest(unittest.TestCase):
         self.assertEqual(summary["sent"], 8)
         self.assertEqual(summary["failed"], 2)
         self.assertEqual(summary["skipped"], 0)
+        self.assertFalse(summary["ok"])
+
+    def test_backend_configuration_error_counts_failure_and_preserves_skipped(self):
+        conn = FakeConnection(published_draws=[{
+            "id": 133,
+            "status": "open",
+            "draw_type": "principal",
+            "product_name": "Principal",
+            "opened_at": datetime.now(timezone.utc),
+        }])
+        backend_data = {
+            "ok": False,
+            "status": "configuration_error",
+            "reason": "manual_email_smtp_not_configured",
+            "failed": 0,
+            "skipped": 2,
+        }
+        with patch(
+            "email_automation_scan.notify_email_automation_event",
+            return_value={
+                "ok": False,
+                "status": 200,
+                "reason": "manual_email_smtp_not_configured",
+                "data": backend_data,
+            },
+        ):
+            summary = run_email_automation_scan(conn)
+
+        self.assertGreaterEqual(summary["failed"], 1)
+        self.assertEqual(summary["skipped"], 2)
+        self.assertFalse(summary["ok"])
 
     def test_separate_published_and_closed_lookbacks_are_applied(self):
         conn = FakeConnection()
@@ -344,6 +376,11 @@ class EmailAutomationScanTest(unittest.TestCase):
         self.assertEqual(
             published_query[1],
             (EMAIL_PUBLISHED_LOOKBACK_HOURS,),
+        )
+        self.assertIn("status = 'open'", published_query[0])
+        self.assertNotIn(
+            "status IN ('open', 'closed', 'sorteado')",
+            published_query[0],
         )
         self.assertIn("closed_at >= NOW()", closed_query[0])
         self.assertEqual(closed_query[1], (EMAIL_CLOSED_LOOKBACK_HOURS,))
@@ -383,10 +420,17 @@ class EmailAutomationScanTest(unittest.TestCase):
                 requests.Timeout("timeout"),
                 {"ok": True, "data": {"sent": 1}},
             ],
-        ) as notify:
+        ) as notify, patch("builtins.print") as log:
             summary = run_email_automation_scan(conn)
 
         self.assertEqual(notify.call_count, 3)
+        self.assertEqual(log.call_count, 2)
+        log.assert_any_call("[email-automation] event_failed", {
+            "event_key": "NEW_DRAW_PUBLISHED",
+            "reference_key": "draw:301:published_email",
+            "status": None,
+            "reason": "backend_request_failed",
+        })
         self.assertEqual(summary["events"], 3)
         self.assertEqual(summary["failed"], 2)
         self.assertEqual(summary["sent"], 1)
@@ -415,6 +459,26 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
             reference_key="draw:133:published_email",
             metadata={"draw_id": 133},
         )
+
+    @patch.dict(os.environ, env, clear=False)
+    @patch("email_automation_events.requests.post")
+    def test_http_200_backend_configuration_error_is_failure(self, post):
+        backend_data = {
+            "ok": False,
+            "status": "configuration_error",
+            "reason": "manual_email_smtp_not_configured",
+            "failed": 0,
+            "skipped": 2,
+        }
+        post.return_value = self.FakeResponse(200, backend_data)
+
+        result = self._notify()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["reason"], "manual_email_smtp_not_configured")
+        self.assertEqual(result["data"], backend_data)
+        self.assertEqual(post.call_count, 1)
 
     @patch.dict(os.environ, env, clear=False)
     @patch("email_automation_events.time.sleep", return_value=None)
@@ -452,6 +516,23 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], 503)
+        self.assertEqual(result["reason"], "unavailable")
+        self.assertEqual(result["data"], {"error": "unavailable"})
+        self.assertEqual(post.call_count, 3)
+
+    @patch.dict(os.environ, env, clear=False)
+    @patch("email_automation_events.time.sleep", return_value=None)
+    @patch("email_automation_events.requests.post")
+    def test_http_500_retries_three_times_and_preserves_backend_error(self, post, _sleep):
+        backend_data = {"error": "email_event_failed"}
+        post.return_value = self.FakeResponse(500, backend_data)
+
+        result = self._notify()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 500)
+        self.assertEqual(result["reason"], "email_event_failed")
+        self.assertEqual(result["data"], backend_data)
         self.assertEqual(post.call_count, 3)
 
     @patch.dict(os.environ, env, clear=False)
@@ -463,6 +544,23 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], 401)
+        self.assertEqual(result["reason"], "unauthorized")
+        self.assertEqual(post.call_count, 1)
+
+    @patch.dict(os.environ, env, clear=False)
+    @patch("email_automation_events.requests.post")
+    def test_http_400_is_not_retried_and_preserves_backend_error(self, post):
+        post.return_value = self.FakeResponse(
+            400,
+            {"error": "email_draw_id_invalid"},
+        )
+
+        result = self._notify()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], 400)
+        self.assertEqual(result["reason"], "email_draw_id_invalid")
+        self.assertEqual(result["data"], {"error": "email_draw_id_invalid"})
         self.assertEqual(post.call_count, 1)
 
     @patch.dict(os.environ, env, clear=False)

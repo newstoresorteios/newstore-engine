@@ -56,11 +56,35 @@ def notify_email_automation_event(
                     "data": data,
                 }
             if response.ok:
+                if isinstance(data, dict) and data.get("ok") is False:
+                    return {
+                        "ok": False,
+                        "status": response.status_code,
+                        "reason": (
+                            data.get("reason")
+                            or data.get("error")
+                            or "backend_event_failed"
+                        ),
+                        "data": data,
+                    }
                 return {"ok": True, "status": response.status_code, "data": data}
             if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_ATTEMPTS:
                 time.sleep(RETRY_DELAYS_SECONDS[attempt - 1])
                 continue
-            return {"ok": False, "status": response.status_code, "reason": "backend_request_failed"}
+            if isinstance(data, dict):
+                reason = (
+                    data.get("reason")
+                    or data.get("error")
+                    or "backend_request_failed"
+                )
+            else:
+                reason = "backend_request_failed"
+            return {
+                "ok": False,
+                "status": response.status_code,
+                "reason": reason,
+                "data": data,
+            }
         except (requests.Timeout, requests.ConnectionError):
             if attempt < MAX_ATTEMPTS:
                 time.sleep(RETRY_DELAYS_SECONDS[attempt - 1])
