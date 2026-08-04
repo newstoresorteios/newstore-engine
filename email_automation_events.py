@@ -9,6 +9,17 @@ MAX_ATTEMPTS = 3
 RETRY_DELAYS_SECONDS = (1, 3)
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 DEDUPE_STATUS_CODES = {409}
+DEFAULT_BACKEND_CONNECT_TIMEOUT_SECONDS = 10
+DEFAULT_BACKEND_READ_TIMEOUT_SECONDS = 240
+
+
+def _positive_int_env(name, default):
+    raw = os.getenv(name)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
 
 
 def notify_email_automation_event(
@@ -36,13 +47,21 @@ def notify_email_automation_event(
         payload["occurred_at"] = occurred_at
 
     url = f"{backend_base_url.rstrip('/')}{EMAIL_EVENTS_PATH}"
+    connect_timeout = _positive_int_env(
+        "EMAIL_AUTOMATION_BACKEND_CONNECT_TIMEOUT_SECONDS",
+        DEFAULT_BACKEND_CONNECT_TIMEOUT_SECONDS,
+    )
+    read_timeout = _positive_int_env(
+        "EMAIL_AUTOMATION_BACKEND_READ_TIMEOUT_SECONDS",
+        DEFAULT_BACKEND_READ_TIMEOUT_SECONDS,
+    )
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             response = requests.post(
                 url,
                 json=payload,
                 headers={"x-internal-token": internal_token},
-                timeout=15,
+                timeout=(connect_timeout, read_timeout),
             )
             try:
                 data = response.json()
@@ -85,11 +104,31 @@ def notify_email_automation_event(
                 "reason": reason,
                 "data": data,
             }
-        except (requests.Timeout, requests.ConnectionError):
+        except requests.ReadTimeout:
+            return {
+                "ok": False,
+                "status": None,
+                "reason": "backend_response_timeout",
+                "delivery_unknown": True,
+            }
+        except requests.ConnectTimeout:
             if attempt < MAX_ATTEMPTS:
                 time.sleep(RETRY_DELAYS_SECONDS[attempt - 1])
                 continue
-            return {"ok": False, "reason": "backend_request_failed"}
+            return {
+                "ok": False,
+                "status": None,
+                "reason": "backend_connection_timeout",
+            }
+        except requests.ConnectionError:
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_DELAYS_SECONDS[attempt - 1])
+                continue
+            return {
+                "ok": False,
+                "status": None,
+                "reason": "backend_connection_failed",
+            }
         except Exception:
             return {"ok": False, "reason": "backend_request_failed"}
     return {"ok": False, "reason": "backend_request_failed"}

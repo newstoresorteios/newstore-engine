@@ -5,7 +5,12 @@ from unittest.mock import patch
 
 import requests
 
-from email_automation_events import notify_email_automation_event
+from email_automation_events import (
+    DEFAULT_BACKEND_CONNECT_TIMEOUT_SECONDS,
+    DEFAULT_BACKEND_READ_TIMEOUT_SECONDS,
+    _positive_int_env,
+    notify_email_automation_event,
+)
 from email_automation_scan import (
     EMAIL_CLOSED_LOOKBACK_HOURS,
     EMAIL_DEFAULT_LOOKBACK_HOURS,
@@ -359,6 +364,34 @@ class EmailAutomationScanTest(unittest.TestCase):
         self.assertEqual(summary["skipped"], 2)
         self.assertFalse(summary["ok"])
 
+    def test_delivery_unknown_timeout_marks_summary_failed_and_logs_reason(self):
+        conn = FakeConnection(published_draws=[{
+            "id": 133,
+            "status": "open",
+            "draw_type": "principal",
+            "product_name": "Principal",
+            "opened_at": datetime.now(timezone.utc),
+        }])
+        with patch(
+            "email_automation_scan.notify_email_automation_event",
+            return_value={
+                "ok": False,
+                "status": None,
+                "reason": "backend_response_timeout",
+                "delivery_unknown": True,
+            },
+        ), patch("builtins.print") as log:
+            summary = run_email_automation_scan(conn)
+
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["ok"])
+        log.assert_called_once_with("[email-automation] event_failed", {
+            "event_key": "NEW_DRAW_PUBLISHED",
+            "reference_key": "draw:133:published_email",
+            "status": None,
+            "reason": "backend_response_timeout",
+        })
+
     def test_separate_published_and_closed_lookbacks_are_applied(self):
         conn = FakeConnection()
         with patch.dict("os.environ", {}, clear=True):
@@ -450,6 +483,8 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
     env = {
         "BACKEND_INTERNAL_API_BASE": "https://backend.example",
         "PUSH_INTERNAL_EVENTS_TOKEN": "token",
+        "EMAIL_AUTOMATION_BACKEND_CONNECT_TIMEOUT_SECONDS": "10",
+        "EMAIL_AUTOMATION_BACKEND_READ_TIMEOUT_SECONDS": "240",
     }
 
     def _notify(self):
@@ -459,6 +494,92 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
             reference_key="draw:133:published_email",
             metadata={"draw_id": 133},
         )
+
+    def test_positive_int_env_uses_default_for_missing_or_invalid_values(self):
+        invalid_values = ("", "invalid", "0", "-1")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                _positive_int_env("MISSING_TIMEOUT", 37),
+                37,
+            )
+        for raw in invalid_values:
+            with self.subTest(raw=raw), patch.dict(
+                os.environ,
+                {"TEST_TIMEOUT": raw},
+                clear=True,
+            ):
+                self.assertEqual(_positive_int_env("TEST_TIMEOUT", 37), 37)
+
+    def test_positive_int_env_accepts_positive_integer(self):
+        with patch.dict(
+            os.environ,
+            {"TEST_TIMEOUT": "91"},
+            clear=True,
+        ):
+            self.assertEqual(_positive_int_env("TEST_TIMEOUT", 37), 91)
+
+    @patch.dict(os.environ, {
+        **env,
+        "EMAIL_AUTOMATION_BACKEND_CONNECT_TIMEOUT_SECONDS": "17",
+        "EMAIL_AUTOMATION_BACKEND_READ_TIMEOUT_SECONDS": "321",
+    }, clear=False)
+    @patch("email_automation_events.requests.post")
+    def test_request_uses_configured_connect_and_read_timeouts(self, post):
+        post.return_value = self.FakeResponse(200, {"ok": True})
+
+        result = self._notify()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(post.call_args.kwargs["timeout"], (17, 321))
+
+    @patch.dict(os.environ, {
+        "BACKEND_INTERNAL_API_BASE": "https://backend.example",
+        "PUSH_INTERNAL_EVENTS_TOKEN": "token",
+    }, clear=True)
+    @patch("email_automation_events.requests.post")
+    def test_request_uses_default_timeouts_when_environment_is_absent(self, post):
+        post.return_value = self.FakeResponse(200, {"ok": True})
+
+        result = self._notify()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(post.call_args.kwargs["timeout"], (
+            DEFAULT_BACKEND_CONNECT_TIMEOUT_SECONDS,
+            DEFAULT_BACKEND_READ_TIMEOUT_SECONDS,
+        ))
+
+    @patch.dict(os.environ, env, clear=False)
+    @patch("email_automation_events.time.sleep", return_value=None)
+    @patch("email_automation_events.requests.post")
+    def test_read_timeout_is_not_retried_and_delivery_is_unknown(self, post, sleep):
+        post.side_effect = requests.ReadTimeout("response timeout")
+
+        result = self._notify()
+
+        self.assertEqual(result, {
+            "ok": False,
+            "status": None,
+            "reason": "backend_response_timeout",
+            "delivery_unknown": True,
+        })
+        self.assertEqual(post.call_count, 1)
+        sleep.assert_not_called()
+
+    @patch.dict(os.environ, env, clear=False)
+    @patch("email_automation_events.time.sleep", return_value=None)
+    @patch("email_automation_events.requests.post")
+    def test_connect_timeout_exhausts_safe_retries(self, post, sleep):
+        post.side_effect = requests.ConnectTimeout("connect timeout")
+
+        result = self._notify()
+
+        self.assertEqual(result, {
+            "ok": False,
+            "status": None,
+            "reason": "backend_connection_timeout",
+        })
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
 
     @patch.dict(os.environ, env, clear=False)
     @patch("email_automation_events.requests.post")
@@ -483,9 +604,9 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
     @patch.dict(os.environ, env, clear=False)
     @patch("email_automation_events.time.sleep", return_value=None)
     @patch("email_automation_events.requests.post")
-    def test_timeout_retries_and_can_recover(self, post, _sleep):
+    def test_connect_timeout_retries_and_can_recover(self, post, _sleep):
         post.side_effect = [
-            requests.Timeout("timeout"),
+            requests.ConnectTimeout("connect timeout"),
             self.FakeResponse(200, {"sent": 1}),
         ]
 
@@ -503,7 +624,8 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
         result = self._notify()
 
         self.assertFalse(result["ok"])
-        self.assertEqual(result["reason"], "backend_request_failed")
+        self.assertIsNone(result["status"])
+        self.assertEqual(result["reason"], "backend_connection_failed")
         self.assertEqual(post.call_count, 3)
 
     @patch.dict(os.environ, env, clear=False)
