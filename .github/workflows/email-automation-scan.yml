@@ -5,6 +5,9 @@ on:
     - cron: "*/10 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: newstore-email-automation-scan
   cancel-in-progress: false
@@ -12,21 +15,22 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt
 
       - name: Run email automation scanner
         env:
@@ -36,6 +40,9 @@ jobs:
           EMAIL_AUTOMATION_DEFAULT_LOOKBACK_HOURS: "24"
           EMAIL_AUTOMATION_PUBLISHED_LOOKBACK_HOURS: "24"
           EMAIL_AUTOMATION_CLOSED_LOOKBACK_HOURS: "72"
+
+          EMAIL_AUTOMATION_BACKEND_CONNECT_TIMEOUT_SECONDS: "10"
+          EMAIL_AUTOMATION_BACKEND_READ_TIMEOUT_SECONDS: "240"
 
           BACKEND_INTERNAL_API_BASE: "https://newstore-backend.onrender.com"
           PUSH_INTERNAL_EVENTS_TOKEN: "f60d817e28fac4ddf3ca391adb338d775a182ac9f2fa492a00540ddd769e2a52"
