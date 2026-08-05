@@ -32,6 +32,23 @@ def _draw_group(draw_type) -> str:
     return "draw" if (draw_type or "principal") == "principal" else "additional_draw"
 
 
+def _draw_name(draw: dict) -> str:
+    configured_name = draw.get("draw_name")
+    if configured_name is None:
+        configured_name = draw.get("product_name")
+    configured_name = str(configured_name or "").strip()
+    if configured_name:
+        return configured_name
+
+    draw_id = int(draw["id"])
+    draw_type = str(draw.get("draw_type") or "principal").strip().lower()
+    if draw_type == "adicional":
+        return f"Sorteio adicional #{draw_id}"
+    if draw_type == "secundario":
+        return f"Sorteio secundário #{draw_id}"
+    return "Sorteio principal"
+
+
 def _remaining_threshold(remaining: int):
     for threshold, event_key in EMAIL_REMAINING_THRESHOLDS:
         if remaining <= threshold:
@@ -43,7 +60,9 @@ def _load_published_draws(conn, lookback_hours: int):
     with conn.cursor() as cur:
         cur.execute("""
             SELECT id, status, COALESCE(draw_type, 'principal') AS draw_type,
-                   product_name, opened_at
+                   product_name,
+                   NULLIF(BTRIM(product_name), '') AS draw_name,
+                   opened_at
               FROM public.draws
              WHERE opened_at IS NOT NULL
                AND opened_at >= NOW() - (%s * INTERVAL '1 hour')
@@ -61,7 +80,9 @@ def _load_published_draws(conn, lookback_hours: int):
 def _load_open_draws(conn):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT id, COALESCE(draw_type, 'principal') AS draw_type, product_name
+            SELECT id, COALESCE(draw_type, 'principal') AS draw_type,
+                   product_name,
+                   NULLIF(BTRIM(product_name), '') AS draw_name
               FROM public.draws
              WHERE status = 'open'
                AND COALESCE(draw_type, 'principal') IN (
@@ -90,7 +111,9 @@ def _load_closed_draws(conn, lookback_hours: int):
     with conn.cursor() as cur:
         cur.execute("""
             SELECT id, status, COALESCE(draw_type, 'principal') AS draw_type,
-                   product_name, closed_at
+                   product_name,
+                   NULLIF(BTRIM(product_name), '') AS draw_name,
+                   closed_at
               FROM public.draws
              WHERE closed_at IS NOT NULL
                AND closed_at >= NOW() - (%s * INTERVAL '1 hour')
@@ -110,6 +133,14 @@ def _iso_datetime(value):
 
 
 def _emit(event_key, reference_type, reference_key, metadata, scan_id, occurred_at=None):
+    log_context = {
+        "draw_id": metadata.get("draw_id"),
+        "draw_type": metadata.get("draw_type"),
+        "draw_name": metadata.get("draw_name"),
+        "event_key": event_key,
+        "reference_key": reference_key,
+    }
+    print("[email-automation] event_detected", log_context)
     try:
         result = notify_email_automation_event(
             event_key=event_key,
@@ -132,8 +163,7 @@ def _emit(event_key, reference_type, reference_key, metadata, scan_id, occurred_
 
     if not isinstance(result, dict) or result.get("ok") is not True:
         print("[email-automation] event_failed", {
-            "event_key": event_key,
-            "reference_key": reference_key,
+            **log_context,
             "status": result.get("status") if isinstance(result, dict) else None,
             "reason": (
                 result.get("reason") or "backend_event_failed"
@@ -218,6 +248,7 @@ def run_email_automation_scan(conn):
 
     for draw in _load_published_draws(conn, published_lookback_hours):
         draw_id = int(draw["id"])
+        draw_name = _draw_name(draw)
         group = _draw_group(draw.get("draw_type"))
         event_key = "NEW_DRAW_PUBLISHED"
         reference_type = "draw" if group == "draw" else "additional_draw"
@@ -226,6 +257,7 @@ def run_email_automation_scan(conn):
         result = _emit(event_key, reference_type, reference_key, {
             "draw_id": draw_id,
             "draw_type": draw.get("draw_type") or "principal",
+            "draw_name": draw_name,
             "opened_at": _iso_datetime(opened_at),
             "product_name": draw.get("product_name") or None,
         }, scan_id, occurred_at=opened_at)
@@ -234,6 +266,7 @@ def run_email_automation_scan(conn):
 
     for draw in _load_open_draws(conn):
         draw_id = int(draw["id"])
+        draw_name = _draw_name(draw)
         snapshot = _load_numbers_snapshot(conn, draw_id)
         remaining = int(snapshot.get("remaining_numbers") or 0)
         selected = _remaining_threshold(remaining)
@@ -246,6 +279,7 @@ def run_email_automation_scan(conn):
         result = _emit(event_key, "draw" if group == "draw" else "additional_draw", reference_key, {
             "draw_id": draw_id,
             "draw_type": draw.get("draw_type") or "principal",
+            "draw_name": draw_name,
             "remaining_numbers": remaining,
             "threshold": threshold,
             "product_name": draw.get("product_name") or None,
@@ -254,6 +288,7 @@ def run_email_automation_scan(conn):
 
     for draw in _load_closed_draws(conn, closed_lookback_hours):
         draw_id = int(draw["id"])
+        draw_name = _draw_name(draw)
         group = _draw_group(draw.get("draw_type"))
         event_key = "DRAW_CLOSED"
         reference_key = f"{group}:{draw_id}:closed_email"
@@ -261,6 +296,7 @@ def run_email_automation_scan(conn):
         result = _emit(event_key, "draw" if group == "draw" else "additional_draw", reference_key, {
             "draw_id": draw_id,
             "draw_type": draw.get("draw_type") or "principal",
+            "draw_name": draw_name,
             "closed_at": _iso_datetime(closed_at),
             "product_name": draw.get("product_name") or None,
         }, scan_id, occurred_at=closed_at)

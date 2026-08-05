@@ -35,12 +35,16 @@ def notify_email_automation_event(
     if not backend_base_url or not internal_token:
         return {"ok": False, "blocked": True, "reason": "backend_config_missing"}
 
+    event_metadata = metadata.copy() if isinstance(metadata, dict) else {}
     payload = {
         "event_key": event_key,
         "reference_type": reference_type,
         "reference_key": reference_key,
-        "metadata": metadata.copy() if isinstance(metadata, dict) else {},
+        "metadata": event_metadata,
     }
+    for field in ("draw_id", "draw_type", "draw_name", "remaining_numbers"):
+        if field in event_metadata:
+            payload[field] = event_metadata[field]
     if scan_id:
         payload["scan_id"] = scan_id
     if occurred_at:

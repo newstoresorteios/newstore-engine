@@ -72,6 +72,150 @@ class FakeConnection:
 
 
 class EmailAutomationScanTest(unittest.TestCase):
+    def _capture_remaining_events(self, draws, remaining_numbers=15):
+        conn = FakeConnection(
+            open_draws=draws,
+            snapshots={
+                int(draw["id"]): {
+                    "total_numbers": 100,
+                    "remaining_numbers": remaining_numbers,
+                    "sold_numbers": 100 - remaining_numbers,
+                }
+                for draw in draws
+            },
+        )
+        with patch(
+            "email_automation_scan.notify_email_automation_event",
+            return_value={"ok": True},
+        ) as notify, patch("builtins.print") as log:
+            run_email_automation_scan(conn)
+        return conn, notify, log
+
+    def test_principal_draw_uses_configured_name(self):
+        _conn, notify, log = self._capture_remaining_events([{
+            "id": 133,
+            "draw_type": "principal",
+            "product_name": "Sorteio Relógio Rolex Submariner",
+        }])
+
+        event = notify.call_args.kwargs
+        self.assertEqual(
+            event["metadata"]["draw_name"],
+            "Sorteio Relógio Rolex Submariner",
+        )
+        log.assert_called_once_with("[email-automation] event_detected", {
+            "draw_id": 133,
+            "draw_type": "principal",
+            "draw_name": "Sorteio Relógio Rolex Submariner",
+            "event_key": "EMAIL_DRAW_REMAINING_15",
+            "reference_key": "draw:133:email_remaining:15",
+        })
+
+    def test_additional_draw_uses_configured_name(self):
+        _conn, notify, _log = self._capture_remaining_events([{
+            "id": 145,
+            "draw_type": "adicional",
+            "product_name": "Sorteio adicional de créditos",
+        }])
+
+        event = notify.call_args.kwargs
+        self.assertEqual(
+            event["metadata"]["draw_name"],
+            "Sorteio adicional de créditos",
+        )
+        self.assertEqual(
+            event["reference_key"],
+            "additional_draw:145:email_remaining:15",
+        )
+
+    def test_secondary_draw_uses_configured_name(self):
+        _conn, notify, _log = self._capture_remaining_events([{
+            "id": 146,
+            "draw_type": "secundario",
+            "product_name": "Sorteio adicional — Vale-compras R$ 5.000",
+        }])
+
+        self.assertEqual(
+            notify.call_args.kwargs["metadata"]["draw_name"],
+            "Sorteio adicional — Vale-compras R$ 5.000",
+        )
+
+    def test_empty_name_uses_principal_fallback(self):
+        _conn, notify, _log = self._capture_remaining_events([{
+            "id": 147,
+            "draw_type": "principal",
+            "product_name": "   ",
+        }])
+
+        self.assertEqual(
+            notify.call_args.kwargs["metadata"]["draw_name"],
+            "Sorteio principal",
+        )
+
+    def test_null_name_uses_type_specific_fallback(self):
+        draws = [
+            {"id": 148, "draw_type": "adicional", "product_name": None},
+            {"id": 149, "draw_type": "secundario", "product_name": None},
+        ]
+        _conn, notify, _log = self._capture_remaining_events(draws)
+
+        self.assertEqual(
+            [call.kwargs["metadata"]["draw_name"] for call in notify.call_args_list],
+            ["Sorteio adicional #148", "Sorteio secundário #149"],
+        )
+
+    def test_accented_name_is_preserved(self):
+        accented_name = "Sorteio edição verão — créditos à vista"
+        _conn, notify, _log = self._capture_remaining_events([{
+            "id": 150,
+            "draw_type": "adicional",
+            "product_name": accented_name,
+        }])
+
+        self.assertEqual(
+            notify.call_args.kwargs["metadata"]["draw_name"],
+            accented_name,
+        )
+
+    def test_changed_name_does_not_change_reference_key(self):
+        draw = {
+            "id": 151,
+            "draw_type": "adicional",
+            "product_name": "Nome original",
+        }
+        _conn, first_notify, _log = self._capture_remaining_events([draw])
+        draw["product_name"] = "Nome atualizado"
+        _conn, second_notify, _log = self._capture_remaining_events([draw])
+
+        self.assertNotEqual(
+            first_notify.call_args.kwargs["metadata"]["draw_name"],
+            second_notify.call_args.kwargs["metadata"]["draw_name"],
+        )
+        self.assertEqual(
+            first_notify.call_args.kwargs["reference_key"],
+            second_notify.call_args.kwargs["reference_key"],
+        )
+        self.assertEqual(
+            second_notify.call_args.kwargs["reference_key"],
+            "additional_draw:151:email_remaining:15",
+        )
+
+    def test_equal_names_remain_distinct_by_draw_id(self):
+        same_name = "Sorteio adicional de créditos"
+        draws = [
+            {"id": 152, "draw_type": "adicional", "product_name": same_name},
+            {"id": 153, "draw_type": "adicional", "product_name": same_name},
+        ]
+        _conn, notify, _log = self._capture_remaining_events(draws)
+
+        self.assertEqual(
+            [call.kwargs["reference_key"] for call in notify.call_args_list],
+            [
+                "additional_draw:152:email_remaining:15",
+                "additional_draw:153:email_remaining:15",
+            ],
+        )
+
     def test_published_principal_and_additional_use_backend_dedupe_keys(self):
         opened_at = datetime.now(timezone.utc)
         conn = FakeConnection(published_draws=[
@@ -385,7 +529,10 @@ class EmailAutomationScanTest(unittest.TestCase):
 
         self.assertEqual(summary["failed"], 1)
         self.assertFalse(summary["ok"])
-        log.assert_called_once_with("[email-automation] event_failed", {
+        log.assert_any_call("[email-automation] event_failed", {
+            "draw_id": 133,
+            "draw_type": "principal",
+            "draw_name": "Principal",
             "event_key": "NEW_DRAW_PUBLISHED",
             "reference_key": "draw:133:published_email",
             "status": None,
@@ -417,6 +564,15 @@ class EmailAutomationScanTest(unittest.TestCase):
         )
         self.assertIn("closed_at >= NOW()", closed_query[0])
         self.assertEqual(closed_query[1], (EMAIL_CLOSED_LOOKBACK_HOURS,))
+        draw_queries = [
+            sql for sql, _params in conn.executions if "FROM public.draws" in sql
+        ]
+        self.assertEqual(len(draw_queries), 3)
+        for query in draw_queries:
+            self.assertIn(
+                "NULLIF(BTRIM(product_name), '') AS draw_name",
+                query,
+            )
         self.assertEqual(EMAIL_DEFAULT_LOOKBACK_HOURS, 24)
         self.assertEqual(EMAIL_PUBLISHED_LOOKBACK_HOURS, 24)
         self.assertEqual(EMAIL_CLOSED_LOOKBACK_HOURS, 72)
@@ -457,8 +613,11 @@ class EmailAutomationScanTest(unittest.TestCase):
             summary = run_email_automation_scan(conn)
 
         self.assertEqual(notify.call_count, 3)
-        self.assertEqual(log.call_count, 2)
+        self.assertEqual(log.call_count, 5)
         log.assert_any_call("[email-automation] event_failed", {
+            "draw_id": 301,
+            "draw_type": "principal",
+            "draw_name": "Primeiro",
             "event_key": "NEW_DRAW_PUBLISHED",
             "reference_key": "draw:301:published_email",
             "status": None,
@@ -531,6 +690,52 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(post.call_args.kwargs["timeout"], (17, 321))
+
+    @patch.dict(os.environ, env, clear=False)
+    @patch("email_automation_events.requests.post")
+    def test_backend_payload_contains_draw_name_and_draw_context(self, post):
+        post.return_value = self.FakeResponse(200, {"ok": True})
+        metadata = {
+            "draw_id": 145,
+            "draw_type": "adicional",
+            "draw_name": "Sorteio adicional de créditos",
+            "remaining_numbers": 15,
+            "threshold": 15,
+            "product_name": "Sorteio adicional de créditos",
+        }
+
+        result = notify_email_automation_event(
+            event_key="EMAIL_DRAW_REMAINING_15",
+            reference_type="additional_draw",
+            reference_key="additional_draw:145:email_remaining:15",
+            metadata=metadata,
+        )
+
+        self.assertTrue(result["ok"])
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["event_key"], "EMAIL_DRAW_REMAINING_15")
+        self.assertEqual(
+            payload["reference_key"],
+            "additional_draw:145:email_remaining:15",
+        )
+        self.assertEqual(payload["draw_id"], 145)
+        self.assertEqual(payload["draw_type"], "adicional")
+        self.assertEqual(payload["draw_name"], "Sorteio adicional de créditos")
+        self.assertEqual(payload["remaining_numbers"], 15)
+        self.assertEqual(payload["metadata"], metadata)
+
+    @patch.dict(os.environ, env, clear=False)
+    @patch("email_automation_events.requests.post")
+    def test_legacy_payload_without_draw_name_still_works(self, post):
+        post.return_value = self.FakeResponse(200, {"ok": True})
+
+        result = self._notify()
+
+        self.assertTrue(result["ok"])
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["metadata"], {"draw_id": 133})
+        self.assertEqual(payload["draw_id"], 133)
+        self.assertNotIn("draw_name", payload)
 
     @patch.dict(os.environ, {
         "BACKEND_INTERNAL_API_BASE": "https://backend.example",
