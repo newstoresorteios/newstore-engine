@@ -927,6 +927,7 @@ class EmailBalanceAutomationScanTest(unittest.TestCase):
         ), patch("builtins.print"):
             summary = run_email_automation_scan(conn, now=self.now)
         self.assertEqual(summary["balance_checked"], 3)
+        self.assertEqual(summary["balance_with_valid_expiry"], 3)
         self.assertEqual(summary["balance_eligible"], 2)
         self.assertEqual(summary["balance_events"], 2)
         self.assertEqual(summary["balance_sent"], 1)

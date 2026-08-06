@@ -513,6 +513,7 @@ def _build_balance_candidates(conn, summary, scan_time):
         if expires_at is None or expires_on is None:
             _balance_skip(summary, "balance_expiration_missing", row)
             continue
+        summary["balance_with_valid_expiry"] += 1
 
         try:
             days_to_expire = int(row.get("days_to_expire"))
@@ -599,6 +600,7 @@ def run_email_automation_scan(
         "remaining_checked": 0,
         "closed_checked": 0,
         "balance_checked": 0,
+        "balance_with_valid_expiry": 0,
         "balance_eligible": 0,
         "balance_events": 0,
         "balance_sent": 0,
