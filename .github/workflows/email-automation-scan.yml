@@ -15,7 +15,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -46,7 +46,11 @@ jobs:
           EMAIL_AUTOMATION_PUBLISHED_LOOKBACK_HOURS: "24"
           EMAIL_AUTOMATION_CLOSED_LOOKBACK_HOURS: "72"
 
+          EMAIL_BALANCE_AUTOMATION_EFFECTIVE_FROM: ${{ vars.EMAIL_BALANCE_AUTOMATION_EFFECTIVE_FROM }}
+          EMAIL_BALANCE_EXPIRED_BACKFILL_ENABLED: "false"
+          EMAIL_AUTOMATION_DRY_RUN: "false"
+
           EMAIL_AUTOMATION_BACKEND_CONNECT_TIMEOUT_SECONDS: "10"
-          EMAIL_AUTOMATION_BACKEND_READ_TIMEOUT_SECONDS: "240"
+          EMAIL_AUTOMATION_BACKEND_READ_TIMEOUT_SECONDS: "45"
 
         run: python run_email_automation_scan.py

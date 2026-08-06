@@ -55,19 +55,29 @@ Balance automation usa `users.coupon_value_cents` como saldo, `users.coupon_upda
 ### Email Automation
 
 O scanner de e-mail roda separadamente do scanner de push. A engine detecta
-publicacao, thresholds de numeros restantes e fechamento de sorteios principais
-e adicionais, e chama o endpoint interno de e-mail do backend. Deduplicacao e
-SMTP permanecem no backend.
+publicacao, thresholds de numeros restantes, fechamento de sorteios e os
+estagios 30/20/10/7/3 dias ou vencido do saldo. O saldo vem exclusivamente da
+view `public.user_coupon_balance_expiry`; a engine nao recalcula a validade.
+Deduplicacao e SMTP permanecem no backend.
 
 ```env
 EMAIL_AUTOMATION_SCAN_ENABLED=true
 EMAIL_AUTOMATION_DEFAULT_LOOKBACK_HOURS=24
 EMAIL_AUTOMATION_PUBLISHED_LOOKBACK_HOURS=24
 EMAIL_AUTOMATION_CLOSED_LOOKBACK_HOURS=72
+EMAIL_BALANCE_AUTOMATION_EFFECTIVE_FROM=2026-08-06T00:00:00Z
+EMAIL_BALANCE_EXPIRED_BACKFILL_ENABLED=false
+EMAIL_AUTOMATION_DRY_RUN=false
+EMAIL_AUTOMATION_BACKEND_CONNECT_TIMEOUT_SECONDS=10
+EMAIL_AUTOMATION_BACKEND_READ_TIMEOUT_SECONDS=45
 ```
 
 O workflow dedicado `.github/workflows/email-automation-scan.yml` reutiliza
-`POSTGRES_URL`, `BACKEND_INTERNAL_API_BASE` e `PUSH_INTERNAL_EVENTS_TOKEN`.
+`POSTGRES_URL`, `BACKEND_INTERNAL_API_BASE` e `PUSH_INTERNAL_EVENTS_TOKEN`, roda
+a cada 10 minutos e possui limite total de 10 minutos. Antes de habilitar uma
+publicacao real, execute `EMAIL_AUTOMATION_DRY_RUN=true python
+run_email_automation_scan.py`. Sem `EMAIL_BALANCE_AUTOMATION_EFFECTIVE_FROM`,
+eventos ja vencidos sao bloqueados por padrao; backfill exige ativacao explicita.
 
 ## Local
 ```bash

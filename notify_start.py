@@ -138,12 +138,12 @@ def send_email(to_addrs, subject, body):
 
     # Dry-run: bloqueia absolutamente
     if DRY_RUN:
-        log("DRY-RUN: envio BLOQUEADO ->", {"to": to_addrs, "subject": subject})
+        log("DRY-RUN: envio BLOQUEADO", {"recipient_count": len(to_addrs)})
         return
 
     # Sandbox: redireciona todos para um único destinatário
     if EMAIL_SANDBOX_TO:
-        log("SANDBOX ativo: redirecionando todos os envios para", EMAIL_SANDBOX_TO)
+        log("SANDBOX ativo: redirecionando envio")
         to_addrs = [EMAIL_SANDBOX_TO]
 
     msg = EmailMessage()
@@ -157,7 +157,7 @@ def send_email(to_addrs, subject, body):
         if SMTP_USER and SMTP_PASS:
             s.login(SMTP_USER, SMTP_PASS)
         s.send_message(msg)
-        log("E-mail enviado para", to_addrs)
+        log("E-mail enviado", {"recipient_count": len(to_addrs)})
 
 
 def build_email_subject(draw_id):

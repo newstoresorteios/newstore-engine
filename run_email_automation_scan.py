@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import os
-import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import psycopg2
@@ -20,31 +19,37 @@ def _clean_pg_url(value: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
-def _mask_pg_url(value: str) -> str:
-    return re.sub(r"://([^:]+):[^@]+@", r"://\1:***@", value or "")
-
-
 def main() -> int:
     if not _env_true("EMAIL_AUTOMATION_SCAN_ENABLED"):
         print("[email-automation] skipped", {"reason": "disabled"})
         return 0
+    dry_run = _env_true("EMAIL_AUTOMATION_DRY_RUN")
     postgres_url = _clean_pg_url(os.getenv("POSTGRES_URL", "").strip())
-    if not postgres_url or not os.getenv("BACKEND_INTERNAL_API_BASE", "").strip() or not os.getenv("PUSH_INTERNAL_EVENTS_TOKEN", "").strip():
+    backend_configured = (
+        bool(os.getenv("BACKEND_INTERNAL_API_BASE", "").strip())
+        and bool(os.getenv("PUSH_INTERNAL_EVENTS_TOKEN", "").strip())
+    )
+    if not postgres_url or (not dry_run and not backend_configured):
         print("[email-automation] failed", {"reason": "missing_required_environment"})
         return 1
-    print("[email-automation] database_connecting", {"postgres_url": _mask_pg_url(postgres_url)})
+    print("[email-automation] database_connecting", {"dry_run": dry_run})
     conn = None
     try:
         conn = psycopg2.connect(postgres_url, cursor_factory=RealDictCursor, sslmode="require")
-        summary = run_email_automation_scan(conn)
-        conn.rollback()
+        summary = run_email_automation_scan(
+            conn,
+            close_connection_before_publish=True,
+        )
         print("[email-automation] completed", summary)
         return 0 if summary.get("ok") else 1
     except Exception as exc:
-        print("[email-automation] failed", {"error": str(exc) or "scan_failed"})
+        print("[email-automation] failed", {
+            "reason": "scan_failed",
+            "error_type": exc.__class__.__name__,
+        })
         return 1
     finally:
-        if conn is not None:
+        if conn is not None and not getattr(conn, "closed", False):
             conn.close()
 
 

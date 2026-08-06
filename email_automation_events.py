@@ -6,11 +6,11 @@ import requests
 
 EMAIL_EVENTS_PATH = "/api/internal/email/events"
 MAX_ATTEMPTS = 3
-RETRY_DELAYS_SECONDS = (1, 3)
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRY_DELAYS_SECONDS = (2, 5, 10)
+RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 DEDUPE_STATUS_CODES = {409}
 DEFAULT_BACKEND_CONNECT_TIMEOUT_SECONDS = 10
-DEFAULT_BACKEND_READ_TIMEOUT_SECONDS = 240
+DEFAULT_BACKEND_READ_TIMEOUT_SECONDS = 45
 
 
 def _positive_int_env(name, default):
@@ -20,6 +20,42 @@ def _positive_int_env(name, default):
     except (TypeError, ValueError):
         return default
     return value if value > 0 else default
+
+
+def _log_context(event_key, reference_key, metadata):
+    safe_metadata = metadata if isinstance(metadata, dict) else {}
+    context = {
+        "event_key": event_key,
+        "reference_key": reference_key,
+    }
+    for field in (
+        "draw_id",
+        "draw_type",
+        "draw_name",
+        "user_id",
+        "expires_on",
+        "days_to_expire",
+        "balance_cents",
+    ):
+        if safe_metadata.get(field) is not None:
+            context[field] = safe_metadata[field]
+    return context
+
+
+def _log_attempt(context, attempt, started_at, status, reason=None):
+    details = {
+        **context,
+        "attempt": attempt,
+        "status": status,
+        "elapsed_ms": max(0, int((time.monotonic() - started_at) * 1000)),
+    }
+    if reason:
+        details["reason"] = reason
+    print("[email-automation] publish_attempt", details)
+
+
+def _retry_delay(attempt):
+    return RETRY_DELAYS_SECONDS[attempt - 1]
 
 
 def notify_email_automation_event(
@@ -42,7 +78,17 @@ def notify_email_automation_event(
         "reference_key": reference_key,
         "metadata": event_metadata,
     }
-    for field in ("draw_id", "draw_type", "draw_name", "remaining_numbers"):
+    for field in (
+        "draw_id",
+        "draw_type",
+        "draw_name",
+        "draw_description",
+        "product_name",
+        "banner_title",
+        "draw_type_label",
+        "remaining_numbers",
+        "status",
+    ):
         if field in event_metadata:
             payload[field] = event_metadata[field]
     if scan_id:
@@ -59,80 +105,158 @@ def notify_email_automation_event(
         "EMAIL_AUTOMATION_BACKEND_READ_TIMEOUT_SECONDS",
         DEFAULT_BACKEND_READ_TIMEOUT_SECONDS,
     )
+    context = _log_context(event_key, reference_key, event_metadata)
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        started_at = time.monotonic()
         try:
             response = requests.post(
                 url,
                 json=payload,
-                headers={"x-internal-token": internal_token},
+                headers={
+                    "X-Internal-Token": internal_token,
+                    "Idempotency-Key": reference_key,
+                },
                 timeout=(connect_timeout, read_timeout),
             )
             try:
                 data = response.json()
+                response_is_valid = isinstance(data, dict)
             except ValueError:
                 data = None
+                response_is_valid = False
+
             if response.status_code in DEDUPE_STATUS_CODES:
+                _log_attempt(context, attempt, started_at, response.status_code)
                 return {
                     "ok": True,
                     "status": response.status_code,
                     "deduped": True,
                     "data": data,
+                    "attempts": attempt,
                 }
+
             if response.ok:
-                if isinstance(data, dict) and data.get("ok") is False:
+                if not response_is_valid:
+                    reason = "backend_invalid_response"
+                    _log_attempt(
+                        context,
+                        attempt,
+                        started_at,
+                        response.status_code,
+                        reason,
+                    )
                     return {
                         "ok": False,
                         "status": response.status_code,
-                        "reason": (
-                            data.get("reason")
-                            or data.get("error")
-                            or "backend_event_failed"
-                        ),
+                        "reason": reason,
                         "data": data,
+                        "attempts": attempt,
                     }
-                return {"ok": True, "status": response.status_code, "data": data}
+                if data.get("ok") is False:
+                    backend_reason = (
+                        data.get("reason")
+                        or data.get("error")
+                        or "backend_event_failed"
+                    )
+                    reason = "backend_http_error"
+                    _log_attempt(
+                        context,
+                        attempt,
+                        started_at,
+                        response.status_code,
+                        reason,
+                    )
+                    return {
+                        "ok": False,
+                        "status": response.status_code,
+                        "reason": reason,
+                        "backend_reason": backend_reason,
+                        "data": data,
+                        "attempts": attempt,
+                    }
+                _log_attempt(context, attempt, started_at, response.status_code)
+                return {
+                    "ok": True,
+                    "status": response.status_code,
+                    "data": data,
+                    "attempts": attempt,
+                }
+
+            reason = "backend_http_error"
             if response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_DELAYS_SECONDS[attempt - 1])
-                continue
-            if isinstance(data, dict):
-                reason = (
-                    data.get("reason")
-                    or data.get("error")
-                    or "backend_request_failed"
+                _log_attempt(
+                    context,
+                    attempt,
+                    started_at,
+                    response.status_code,
+                    reason,
                 )
-            else:
-                reason = "backend_request_failed"
+                time.sleep(_retry_delay(attempt))
+                continue
+            _log_attempt(
+                context,
+                attempt,
+                started_at,
+                response.status_code,
+                reason,
+            )
+            backend_reason = None
+            if isinstance(data, dict):
+                backend_reason = data.get("reason") or data.get("error")
             return {
                 "ok": False,
                 "status": response.status_code,
                 "reason": reason,
+                "backend_reason": backend_reason,
                 "data": data,
-            }
-        except requests.ReadTimeout:
-            return {
-                "ok": False,
-                "status": None,
-                "reason": "backend_response_timeout",
-                "delivery_unknown": True,
+                "attempts": attempt,
             }
         except requests.ConnectTimeout:
+            reason = "backend_connect_timeout"
+            _log_attempt(context, attempt, started_at, None, reason)
             if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_DELAYS_SECONDS[attempt - 1])
+                time.sleep(_retry_delay(attempt))
                 continue
             return {
                 "ok": False,
                 "status": None,
-                "reason": "backend_connection_timeout",
+                "reason": reason,
+                "attempts": attempt,
+            }
+        except requests.ReadTimeout:
+            reason = "backend_read_timeout"
+            _log_attempt(context, attempt, started_at, None, reason)
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(_retry_delay(attempt))
+                continue
+            return {
+                "ok": False,
+                "status": None,
+                "reason": reason,
+                "delivery_unknown": True,
+                "attempts": attempt,
             }
         except requests.ConnectionError:
+            reason = "backend_connection_error"
+            _log_attempt(context, attempt, started_at, None, reason)
             if attempt < MAX_ATTEMPTS:
-                time.sleep(RETRY_DELAYS_SECONDS[attempt - 1])
+                time.sleep(_retry_delay(attempt))
                 continue
             return {
                 "ok": False,
                 "status": None,
-                "reason": "backend_connection_failed",
+                "reason": reason,
+                "attempts": attempt,
             }
         except Exception:
-            return {"ok": False, "reason": "backend_request_failed"}
-    return {"ok": False, "reason": "backend_request_failed"}
+            reason = "backend_connection_error"
+            _log_attempt(context, attempt, started_at, None, reason)
+            return {
+                "ok": False,
+                "status": None,
+                "reason": reason,
+                "attempts": attempt,
+            }
+
+    return {"ok": False, "reason": "backend_connection_error"}

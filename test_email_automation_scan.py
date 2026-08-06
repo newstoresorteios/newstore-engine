@@ -12,6 +12,7 @@ from email_automation_events import (
     notify_email_automation_event,
 )
 from email_automation_scan import (
+    EMAIL_BALANCE_EXPIRING_EVENTS,
     EMAIL_CLOSED_LOOKBACK_HOURS,
     EMAIL_DEFAULT_LOOKBACK_HOURS,
     EMAIL_PUBLISHED_LOOKBACK_HOURS,
@@ -36,13 +37,15 @@ class FakeCursor:
         self.conn.executions.append((" ".join(sql.split()), params))
         if "opened_at IS NOT NULL" in sql:
             self.rows = self.conn.published_draws
-        elif "status = 'open'" in sql:
+        elif ".status = 'open'" in sql or "status = 'open'" in sql:
             self.rows = self.conn.open_draws
         elif "closed_at IS NOT NULL" in sql:
             self.rows = self.conn.closed_draws
         elif "FROM public.numbers" in sql:
             draw_id = int(params[0])
             self.rows = [self.conn.snapshots[draw_id]]
+        elif "FROM public.user_coupon_balance_expiry" in sql:
+            self.rows = self.conn.balance_rows
         else:
             self.rows = []
 
@@ -60,11 +63,13 @@ class FakeConnection:
         open_draws=None,
         snapshots=None,
         closed_draws=None,
+        balance_rows=None,
     ):
         self.published_draws = published_draws or []
         self.open_draws = open_draws or []
         self.snapshots = snapshots or {}
         self.closed_draws = closed_draws or []
+        self.balance_rows = balance_rows or []
         self.executions = []
 
     def cursor(self):
@@ -570,7 +575,7 @@ class EmailAutomationScanTest(unittest.TestCase):
         self.assertEqual(len(draw_queries), 3)
         for query in draw_queries:
             self.assertIn(
-                "NULLIF(BTRIM(product_name), '') AS draw_name",
+                "AS draw_name",
                 query,
             )
         self.assertEqual(EMAIL_DEFAULT_LOOKBACK_HOURS, 24)
@@ -627,6 +632,411 @@ class EmailAutomationScanTest(unittest.TestCase):
         self.assertEqual(summary["failed"], 2)
         self.assertEqual(summary["sent"], 1)
         self.assertFalse(summary["ok"])
+
+
+class EmailBalanceAutomationScanTest(unittest.TestCase):
+    now = datetime(2026, 8, 6, 13, 0, tzinfo=timezone.utc)
+    base_env = {
+        "EMAIL_AUTOMATION_DRY_RUN": "false",
+        "EMAIL_BALANCE_EXPIRED_BACKFILL_ENABLED": "false",
+        "EMAIL_BALANCE_AUTOMATION_EFFECTIVE_FROM": "2026-01-01T00:00:00Z",
+    }
+
+    def _row(
+        self,
+        *,
+        user_id=123,
+        balance_cents=15000,
+        email="cliente@example.com",
+        expires_at=None,
+        expires_on=None,
+        days_to_expire=30,
+    ):
+        expiry = expires_at or datetime(2026, 9, 5, 3, 0, tzinfo=timezone.utc)
+        return {
+            "user_id": user_id,
+            "name": "Cliente",
+            "email": email,
+            "balance_cents": balance_cents,
+            "balance_reference_at": datetime(
+                2026, 3, 5, 3, 0, tzinfo=timezone.utc
+            ),
+            "expires_at": expiry,
+            "expires_on": expires_on if expires_on is not None else expiry.date(),
+            "days_to_expire": days_to_expire,
+            "expiry_source": "approved_payment",
+        }
+
+    def _run(self, rows, result=None, env=None):
+        conn = FakeConnection(balance_rows=rows)
+        configured_env = {**self.base_env, **(env or {})}
+        with patch.dict(os.environ, configured_env, clear=False), patch(
+            "email_automation_scan.notify_email_automation_event",
+            return_value=result or {"ok": True, "data": {"sent": 1}},
+        ) as notify, patch("builtins.print") as log:
+            summary = run_email_automation_scan(conn, now=self.now)
+        return conn, summary, notify, log
+
+    def _assert_expiring_day(self, days, event_key):
+        row = self._row(days_to_expire=days)
+        _conn, summary, notify, _log = self._run([row])
+        event = notify.call_args.kwargs
+        self.assertEqual(event["event_key"], event_key)
+        self.assertEqual(
+            event["reference_key"],
+            f"user_balance:123:expires:2026-09-05:email:{days}_days",
+        )
+        self.assertEqual(event["reference_type"], "user_balance")
+        self.assertEqual(summary["balance_eligible"], 1)
+
+    def test_day_30_generates_event(self):
+        self._assert_expiring_day(30, "EMAIL_BALANCE_EXPIRING_30_DAYS")
+
+    def test_day_20_generates_event(self):
+        self._assert_expiring_day(20, "EMAIL_BALANCE_EXPIRING_20_DAYS")
+
+    def test_day_10_generates_event(self):
+        self._assert_expiring_day(10, "EMAIL_BALANCE_EXPIRING_10_DAYS")
+
+    def test_day_7_generates_event(self):
+        self._assert_expiring_day(7, "EMAIL_BALANCE_EXPIRING_7_DAYS")
+
+    def test_day_3_generates_event(self):
+        self._assert_expiring_day(3, "EMAIL_BALANCE_EXPIRING_3_DAYS")
+
+    def test_negative_day_generates_expired_event(self):
+        row = self._row(
+            days_to_expire=-1,
+            expires_at=datetime(2026, 8, 5, 3, 0, tzinfo=timezone.utc),
+        )
+        _conn, summary, notify, _log = self._run([row])
+        self.assertEqual(notify.call_args.kwargs["event_key"], "EMAIL_BALANCE_EXPIRED")
+        self.assertEqual(
+            notify.call_args.kwargs["reference_key"],
+            "user_balance:123:expires:2026-08-05:email:expired",
+        )
+        self.assertEqual(summary["balance_events"], 1)
+
+    def test_intermediate_days_do_not_generate_events(self):
+        rows = [
+            self._row(user_id=index + 1, days_to_expire=days)
+            for index, days in enumerate((29, 19, 9, 6, 2))
+        ]
+        _conn, summary, notify, _log = self._run(rows)
+        notify.assert_not_called()
+        self.assertEqual(summary["balance_checked"], 5)
+        self.assertEqual(summary["balance_skipped"], 5)
+
+    def test_day_zero_is_not_assumed_expired(self):
+        _conn, summary, notify, _log = self._run([
+            self._row(days_to_expire=0),
+        ])
+        notify.assert_not_called()
+        self.assertEqual(summary["balance_skipped"], 1)
+
+    def test_zero_balance_is_ignored(self):
+        _conn, summary, notify, _log = self._run([
+            self._row(balance_cents=0),
+        ])
+        notify.assert_not_called()
+        self.assertEqual(summary["balance_skipped"], 1)
+
+    def test_null_expiration_is_ignored(self):
+        row = self._row()
+        row["expires_at"] = None
+        row["expires_on"] = None
+        _conn, summary, notify, _log = self._run([row])
+        notify.assert_not_called()
+        self.assertEqual(summary["balance_skipped"], 1)
+
+    def test_invalid_user_and_email_are_ignored(self):
+        rows = [
+            self._row(user_id=None),
+            self._row(user_id=124, email="sem-arroba"),
+            self._row(user_id=125, email=""),
+        ]
+        _conn, summary, notify, _log = self._run(rows)
+        notify.assert_not_called()
+        self.assertEqual(summary["balance_skipped"], 3)
+
+    def test_reference_is_stable_and_balance_change_does_not_change_it(self):
+        first = self._row(balance_cents=15000)
+        second = self._row(balance_cents=9900)
+        _conn, _summary, first_notify, _log = self._run([first])
+        _conn, _summary, second_notify, _log = self._run([second])
+        self.assertEqual(
+            first_notify.call_args.kwargs["reference_key"],
+            second_notify.call_args.kwargs["reference_key"],
+        )
+
+    def test_expiration_change_creates_new_reference(self):
+        first = self._row()
+        second = self._row(
+            expires_at=datetime(2026, 9, 6, 3, 0, tzinfo=timezone.utc),
+        )
+        _conn, _summary, first_notify, _log = self._run([first])
+        _conn, _summary, second_notify, _log = self._run([second])
+        self.assertNotEqual(
+            first_notify.call_args.kwargs["reference_key"],
+            second_notify.call_args.kwargs["reference_key"],
+        )
+
+    def test_old_expired_balance_is_blocked(self):
+        row = self._row(
+            days_to_expire=-30,
+            expires_at=datetime(2026, 7, 1, 3, 0, tzinfo=timezone.utc),
+        )
+        _conn, summary, notify, log = self._run([row], env={
+            "EMAIL_BALANCE_AUTOMATION_EFFECTIVE_FROM": "2026-08-01T00:00:00Z",
+        })
+        notify.assert_not_called()
+        self.assertEqual(summary["balance_expired_before_effective_from"], 1)
+        self.assertEqual(summary["balance_skipped"], 1)
+        self.assertIn(
+            "balance_expired_before_effective_from",
+            str(log.call_args_list),
+        )
+
+    def test_enabled_backfill_allows_old_expired_balance(self):
+        row = self._row(
+            days_to_expire=-30,
+            expires_at=datetime(2026, 7, 1, 3, 0, tzinfo=timezone.utc),
+        )
+        _conn, summary, notify, _log = self._run([row], env={
+            "EMAIL_BALANCE_AUTOMATION_EFFECTIVE_FROM": "2026-08-01T00:00:00Z",
+            "EMAIL_BALANCE_EXPIRED_BACKFILL_ENABLED": "true",
+        })
+        self.assertEqual(notify.call_count, 1)
+        self.assertEqual(summary["balance_eligible"], 1)
+
+    def test_balance_payload_uses_canonical_fields_without_name_or_email(self):
+        _conn, _summary, notify, _log = self._run([self._row()])
+        metadata = notify.call_args.kwargs["metadata"]
+        self.assertEqual(metadata, {
+            "user_id": 123,
+            "balance_cents": 15000,
+            "balance_reference_at": "2026-03-05T03:00:00+00:00",
+            "expires_at": "2026-09-05T03:00:00+00:00",
+            "expires_on": "2026-09-05",
+            "days_to_expire": 30,
+            "expiry_source": "approved_payment",
+        })
+        self.assertNotIn("name", metadata)
+        self.assertNotIn("email", metadata)
+
+    def test_failure_does_not_interrupt_other_balance_events(self):
+        rows = [self._row(user_id=123), self._row(user_id=124)]
+        conn = FakeConnection(balance_rows=rows)
+        with patch.dict(os.environ, self.base_env, clear=False), patch(
+            "email_automation_scan.notify_email_automation_event",
+            side_effect=[
+                {"ok": False, "reason": "backend_http_error"},
+                {"ok": True, "data": {"sent": 1}},
+            ],
+        ) as notify, patch("builtins.print"):
+            summary = run_email_automation_scan(conn, now=self.now)
+        self.assertEqual(notify.call_count, 2)
+        self.assertEqual(summary["balance_failed"], 1)
+        self.assertEqual(summary["balance_sent"], 1)
+        self.assertFalse(summary["ok"])
+
+    def test_draw_failure_does_not_interrupt_balance_event(self):
+        conn = FakeConnection(
+            open_draws=[{
+                "id": 133,
+                "status": "open",
+                "draw_type": "principal",
+                "product_name": "Principal",
+            }],
+            snapshots={133: {"remaining_numbers": 15}},
+            balance_rows=[self._row()],
+        )
+        with patch.dict(os.environ, self.base_env, clear=False), patch(
+            "email_automation_scan.notify_email_automation_event",
+            side_effect=[
+                {"ok": False, "reason": "backend_http_error"},
+                {"ok": True, "data": {"sent": 1}},
+            ],
+        ) as notify, patch("builtins.print"):
+            summary = run_email_automation_scan(conn, now=self.now)
+        self.assertEqual(notify.call_count, 2)
+        self.assertEqual(summary["balance_sent"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertFalse(summary["ok"])
+
+    def test_balance_source_failure_does_not_interrupt_draw_event(self):
+        class FailingBalanceCursor(FakeCursor):
+            def execute(self, sql, params=()):
+                if "user_coupon_balance_expiry" in sql:
+                    raise RuntimeError("view unavailable")
+                super().execute(sql, params)
+
+        class FailingBalanceConnection(FakeConnection):
+            def cursor(self):
+                return FailingBalanceCursor(self)
+
+        conn = FailingBalanceConnection(
+            open_draws=[{
+                "id": 133,
+                "status": "open",
+                "draw_type": "principal",
+                "product_name": "Principal",
+            }],
+            snapshots={133: {"remaining_numbers": 15}},
+        )
+        with patch.dict(os.environ, self.base_env, clear=False), patch(
+            "email_automation_scan.notify_email_automation_event",
+            return_value={"ok": True, "data": {"sent": 1}},
+        ) as notify, patch("builtins.print"):
+            summary = run_email_automation_scan(conn, now=self.now)
+        self.assertEqual(notify.call_count, 1)
+        self.assertEqual(summary["balance_failed"], 1)
+        self.assertEqual(summary["sent"], 1)
+        self.assertFalse(summary["ok"])
+
+    def test_deduplicated_event_is_not_failure(self):
+        result = {"ok": True, "status": 409, "deduped": True}
+        _conn, summary, _notify, _log = self._run([self._row()], result=result)
+        self.assertEqual(summary["balance_deduped"], 1)
+        self.assertEqual(summary["balance_failed"], 0)
+        self.assertTrue(summary["ok"])
+
+    def test_backend_recipient_failure_counts_as_balance_failure(self):
+        result = {
+            "ok": True,
+            "data": {"sent": 0, "failed": 1, "deduped": 0},
+        }
+        _conn, summary, _notify, _log = self._run([self._row()], result=result)
+        self.assertEqual(summary["balance_sent"], 0)
+        self.assertEqual(summary["balance_failed"], 1)
+        self.assertFalse(summary["ok"])
+
+    def test_balance_counters_are_event_based(self):
+        rows = [
+            self._row(user_id=123, days_to_expire=30),
+            self._row(user_id=124, days_to_expire=20),
+            self._row(user_id=125, days_to_expire=29),
+        ]
+        conn = FakeConnection(balance_rows=rows)
+        with patch.dict(os.environ, self.base_env, clear=False), patch(
+            "email_automation_scan.notify_email_automation_event",
+            side_effect=[
+                {"ok": True, "data": {"sent": 1}},
+                {"ok": True, "status": 409, "deduped": True},
+            ],
+        ), patch("builtins.print"):
+            summary = run_email_automation_scan(conn, now=self.now)
+        self.assertEqual(summary["balance_checked"], 3)
+        self.assertEqual(summary["balance_eligible"], 2)
+        self.assertEqual(summary["balance_events"], 2)
+        self.assertEqual(summary["balance_sent"], 1)
+        self.assertEqual(summary["balance_deduped"], 1)
+        self.assertEqual(summary["balance_failed"], 0)
+        self.assertEqual(summary["balance_skipped"], 1)
+        self.assertEqual(summary["events"], 2)
+
+    def test_dry_run_builds_events_without_publishing(self):
+        _conn, summary, notify, log = self._run([self._row()], env={
+            "EMAIL_AUTOMATION_DRY_RUN": "true",
+        })
+        notify.assert_not_called()
+        self.assertTrue(summary["dry_run"])
+        self.assertEqual(summary["balance_events"], 1)
+        self.assertEqual(summary["balance_sent"], 0)
+        self.assertTrue(summary["ok"])
+        self.assertIn("would_publish", str(log.call_args_list))
+
+    def test_balance_candidates_are_loaded_in_one_canonical_view_query(self):
+        conn, _summary, _notify, _log = self._run([self._row()])
+        queries = [
+            sql for sql, _params in conn.executions
+            if "user_coupon_balance_expiry" in sql
+        ]
+        self.assertEqual(len(queries), 1)
+        self.assertIn("WHERE balance_cents > 0", queries[0])
+        for field in (
+            "user_id",
+            "balance_reference_at",
+            "expires_at",
+            "expires_on",
+            "days_to_expire",
+            "expiry_source",
+        ):
+            self.assertIn(field, queries[0])
+
+    def test_draw_snapshots_and_type_label_remain_in_payload(self):
+        draw = {
+            "id": 151,
+            "status": "open",
+            "draw_type": "secundario",
+            "product_name": "Vale-compras",
+            "draw_description": "Descrição pública",
+            "banner_title": "Banner",
+        }
+        conn = FakeConnection(
+            open_draws=[draw],
+            snapshots={151: {"remaining_numbers": 15}},
+        )
+        with patch.dict(os.environ, self.base_env, clear=False), patch(
+            "email_automation_scan.notify_email_automation_event",
+            return_value={"ok": True},
+        ) as notify, patch("builtins.print"):
+            run_email_automation_scan(conn, now=self.now)
+        event = notify.call_args.kwargs
+        metadata = event["metadata"]
+        self.assertEqual(metadata["draw_type"], "secundario")
+        self.assertEqual(metadata["draw_type_label"], "Sorteio secundário")
+        self.assertEqual(metadata["draw_name"], "Vale-compras")
+        self.assertEqual(metadata["draw_description"], "Descrição pública")
+        self.assertEqual(metadata["banner_title"], "Banner")
+        self.assertEqual(metadata["remaining_numbers"], 15)
+        self.assertEqual(metadata["status"], "open")
+        self.assertEqual(
+            event["reference_key"],
+            "additional_draw:151:email_remaining:15",
+        )
+
+    def test_database_connection_is_closed_before_http_publication(self):
+        class ClosableFakeConnection(FakeConnection):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.closed = False
+                self.rollback_count = 0
+
+            def rollback(self):
+                self.rollback_count += 1
+
+            def close(self):
+                self.closed = True
+
+        conn = ClosableFakeConnection(balance_rows=[self._row()])
+
+        def assert_closed_before_publish(**_kwargs):
+            self.assertTrue(conn.closed)
+            return {"ok": True, "data": {"sent": 1}}
+
+        with patch.dict(os.environ, self.base_env, clear=False), patch(
+            "email_automation_scan.notify_email_automation_event",
+            side_effect=assert_closed_before_publish,
+        ), patch("builtins.print"):
+            summary = run_email_automation_scan(
+                conn,
+                close_connection_before_publish=True,
+                now=self.now,
+            )
+
+        self.assertTrue(summary["ok"])
+        self.assertTrue(conn.closed)
+        self.assertGreaterEqual(conn.rollback_count, 1)
+
+    def test_declared_balance_event_mapping_is_exact(self):
+        self.assertEqual(EMAIL_BALANCE_EXPIRING_EVENTS, {
+            30: "EMAIL_BALANCE_EXPIRING_30_DAYS",
+            20: "EMAIL_BALANCE_EXPIRING_20_DAYS",
+            10: "EMAIL_BALANCE_EXPIRING_10_DAYS",
+            7: "EMAIL_BALANCE_EXPIRING_7_DAYS",
+            3: "EMAIL_BALANCE_EXPIRING_3_DAYS",
+        })
 
 
 class EmailAutomationEventRetryTest(unittest.TestCase):
@@ -699,6 +1109,10 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
             "draw_id": 145,
             "draw_type": "adicional",
             "draw_name": "Sorteio adicional de créditos",
+            "draw_description": "Créditos para usar na loja",
+            "banner_title": "Créditos New Store",
+            "draw_type_label": "Sorteio adicional",
+            "status": "open",
             "remaining_numbers": 15,
             "threshold": 15,
             "product_name": "Sorteio adicional de créditos",
@@ -721,8 +1135,57 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
         self.assertEqual(payload["draw_id"], 145)
         self.assertEqual(payload["draw_type"], "adicional")
         self.assertEqual(payload["draw_name"], "Sorteio adicional de créditos")
+        self.assertEqual(
+            payload["draw_description"],
+            "Créditos para usar na loja",
+        )
+        self.assertEqual(payload["banner_title"], "Créditos New Store")
+        self.assertEqual(payload["draw_type_label"], "Sorteio adicional")
+        self.assertEqual(payload["status"], "open")
         self.assertEqual(payload["remaining_numbers"], 15)
         self.assertEqual(payload["metadata"], metadata)
+        self.assertEqual(
+            post.call_args.kwargs["headers"]["Idempotency-Key"],
+            "additional_draw:145:email_remaining:15",
+        )
+
+    @patch.dict(os.environ, env, clear=False)
+    @patch("email_automation_events.requests.post")
+    def test_backend_balance_payload_preserves_canonical_metadata(self, post):
+        post.return_value = self.FakeResponse(200, {"ok": True})
+        metadata = {
+            "user_id": 123,
+            "balance_cents": 15000,
+            "balance_reference_at": "2026-03-05T03:00:00Z",
+            "expires_at": "2026-09-05T03:00:00Z",
+            "expires_on": "2026-09-05",
+            "days_to_expire": 30,
+            "expiry_source": "approved_payment",
+        }
+        reference_key = (
+            "user_balance:123:expires:2026-09-05:email:30_days"
+        )
+
+        notify_email_automation_event(
+            event_key="EMAIL_BALANCE_EXPIRING_30_DAYS",
+            reference_type="user_balance",
+            reference_key=reference_key,
+            scan_id="email-scan:20260806T130000Z:abc123",
+            occurred_at="2026-08-06T13:00:00Z",
+            metadata=metadata,
+        )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["metadata"], metadata)
+        self.assertNotIn("name", payload["metadata"])
+        self.assertNotIn("email", payload["metadata"])
+        self.assertEqual(
+            post.call_args.kwargs["headers"],
+            {
+                "X-Internal-Token": "token",
+                "Idempotency-Key": reference_key,
+            },
+        )
 
     @patch.dict(os.environ, env, clear=False)
     @patch("email_automation_events.requests.post")
@@ -756,7 +1219,7 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
     @patch.dict(os.environ, env, clear=False)
     @patch("email_automation_events.time.sleep", return_value=None)
     @patch("email_automation_events.requests.post")
-    def test_read_timeout_is_not_retried_and_delivery_is_unknown(self, post, sleep):
+    def test_read_timeout_is_retried_and_delivery_is_unknown(self, post, sleep):
         post.side_effect = requests.ReadTimeout("response timeout")
 
         result = self._notify()
@@ -764,11 +1227,15 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
         self.assertEqual(result, {
             "ok": False,
             "status": None,
-            "reason": "backend_response_timeout",
+            "reason": "backend_read_timeout",
             "delivery_unknown": True,
+            "attempts": 3,
         })
-        self.assertEqual(post.call_count, 1)
-        sleep.assert_not_called()
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [2, 5],
+        )
 
     @patch.dict(os.environ, env, clear=False)
     @patch("email_automation_events.time.sleep", return_value=None)
@@ -781,7 +1248,8 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
         self.assertEqual(result, {
             "ok": False,
             "status": None,
-            "reason": "backend_connection_timeout",
+            "reason": "backend_connect_timeout",
+            "attempts": 3,
         })
         self.assertEqual(post.call_count, 3)
         self.assertEqual(sleep.call_count, 2)
@@ -802,7 +1270,11 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], 200)
-        self.assertEqual(result["reason"], "manual_email_smtp_not_configured")
+        self.assertEqual(result["reason"], "backend_http_error")
+        self.assertEqual(
+            result["backend_reason"],
+            "manual_email_smtp_not_configured",
+        )
         self.assertEqual(result["data"], backend_data)
         self.assertEqual(post.call_count, 1)
 
@@ -819,6 +1291,13 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(post.call_count, 2)
+        first = post.call_args_list[0].kwargs
+        second = post.call_args_list[1].kwargs
+        self.assertEqual(first["json"], second["json"])
+        self.assertEqual(
+            first["headers"]["Idempotency-Key"],
+            second["headers"]["Idempotency-Key"],
+        )
 
     @patch.dict(os.environ, env, clear=False)
     @patch("email_automation_events.time.sleep", return_value=None)
@@ -830,7 +1309,7 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertIsNone(result["status"])
-        self.assertEqual(result["reason"], "backend_connection_failed")
+        self.assertEqual(result["reason"], "backend_connection_error")
         self.assertEqual(post.call_count, 3)
 
     @patch.dict(os.environ, env, clear=False)
@@ -843,9 +1322,25 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], 503)
-        self.assertEqual(result["reason"], "unavailable")
+        self.assertEqual(result["reason"], "backend_http_error")
+        self.assertEqual(result["backend_reason"], "unavailable")
         self.assertEqual(result["data"], {"error": "unavailable"})
         self.assertEqual(post.call_count, 3)
+
+    @patch.dict(os.environ, env, clear=False)
+    @patch("email_automation_events.time.sleep", return_value=None)
+    @patch("email_automation_events.requests.post")
+    def test_http_502_retries_and_can_recover(self, post, sleep):
+        post.side_effect = [
+            self.FakeResponse(502, {"error": "bad_gateway"}),
+            self.FakeResponse(200, {"ok": True}),
+        ]
+
+        result = self._notify()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once_with(2)
 
     @patch.dict(os.environ, env, clear=False)
     @patch("email_automation_events.time.sleep", return_value=None)
@@ -858,7 +1353,8 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], 500)
-        self.assertEqual(result["reason"], "email_event_failed")
+        self.assertEqual(result["reason"], "backend_http_error")
+        self.assertEqual(result["backend_reason"], "email_event_failed")
         self.assertEqual(result["data"], backend_data)
         self.assertEqual(post.call_count, 3)
 
@@ -871,7 +1367,8 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], 401)
-        self.assertEqual(result["reason"], "unauthorized")
+        self.assertEqual(result["reason"], "backend_http_error")
+        self.assertEqual(result["backend_reason"], "unauthorized")
         self.assertEqual(post.call_count, 1)
 
     @patch.dict(os.environ, env, clear=False)
@@ -886,7 +1383,8 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], 400)
-        self.assertEqual(result["reason"], "email_draw_id_invalid")
+        self.assertEqual(result["reason"], "backend_http_error")
+        self.assertEqual(result["backend_reason"], "email_draw_id_invalid")
         self.assertEqual(result["data"], {"error": "email_draw_id_invalid"})
         self.assertEqual(post.call_count, 1)
 
@@ -901,6 +1399,46 @@ class EmailAutomationEventRetryTest(unittest.TestCase):
         self.assertTrue(result["deduped"])
         self.assertEqual(result["status"], 409)
         self.assertEqual(post.call_count, 1)
+
+    @patch.dict(os.environ, env, clear=False)
+    @patch("email_automation_events.requests.post")
+    def test_invalid_success_response_is_classified(self, post):
+        response = self.FakeResponse(200)
+
+        def invalid_json():
+            raise ValueError("invalid json")
+
+        response.json = invalid_json
+        post.return_value = response
+
+        result = self._notify()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "backend_invalid_response")
+        self.assertEqual(post.call_count, 1)
+
+    @patch.dict(os.environ, env, clear=False)
+    @patch("email_automation_events.requests.post")
+    def test_logs_do_not_contain_token_or_email(self, post):
+        post.return_value = self.FakeResponse(200, {"ok": True})
+        with patch("builtins.print") as log:
+            notify_email_automation_event(
+                event_key="EMAIL_BALANCE_EXPIRING_30_DAYS",
+                reference_type="user_balance",
+                reference_key=(
+                    "user_balance:123:expires:2026-09-05:email:30_days"
+                ),
+                metadata={
+                    "user_id": 123,
+                    "balance_cents": 15000,
+                    "expires_on": "2026-09-05",
+                    "days_to_expire": 30,
+                },
+            )
+
+        rendered_logs = str(log.call_args_list)
+        self.assertNotIn("token", rendered_logs)
+        self.assertNotIn("cliente@example.com", rendered_logs)
 
 
 if __name__ == "__main__":
