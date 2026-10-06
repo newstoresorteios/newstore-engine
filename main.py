@@ -4,6 +4,7 @@ from email.message import EmailMessage
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
+import time as retry_clock
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from push_automation_events import notify_push_automation_event
@@ -353,20 +354,37 @@ def _winner_identity_from_row(row):
         row.get("email"),
     )
 
+def _single_owner_row(rows, draw_id: int, number: int, source: str):
+    """Reduz as linhas ao unico usuario distinto. Mais de um usuario e ambiguidade explicita
+    (nunca escolhemos o primeiro); varias linhas do MESMO user_id nao sao ambiguidade."""
+    owners = {}
+    for row in rows or []:
+        if row.get("user_id") is not None:
+            owners.setdefault(row["user_id"], row)
+    if len(owners) > 1:
+        print("[winner] ambiguous_paid_owner", {
+            "draw_id": draw_id,
+            "winner_number": number,
+            "owners_count": len(owners),
+            "source": source,
+        })
+        raise RuntimeError(f"ambiguous_paid_owner draw_id={draw_id} number={number}")
+    return next(iter(owners.values())) if owners else None
+
+
 def paid_user_for_number_fallback(conn, draw_id: int, number: int):
     """Compatibility fallback when public.numbers has sold row without reservation_id."""
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT r.user_id, u.name, u.email
+            SELECT DISTINCT r.user_id, u.name, u.email
               FROM public.reservations r
          LEFT JOIN public.payments p ON p.id = r.payment_id AND p.draw_id = %s
          LEFT JOIN public.users u ON u.id = r.user_id
              WHERE r.draw_id = %s
                AND %s = ANY(r.numbers)
                AND (r.status = 'paid' OR p.status IN ('approved','paid'))
-             LIMIT 1
         """, (draw_id, draw_id, number))
-        r = cur.fetchone()
+        r = _single_owner_row(cur.fetchall(), draw_id, number, "legacy_reservations")
         user_id, winner_name, winner_email = _winner_identity_from_row(r)
         print("[winner] fallback lookup", {
             "draw_id": draw_id,
@@ -375,6 +393,68 @@ def paid_user_for_number_fallback(conn, draw_id: int, number: int):
             "winner_user_id": user_id,
         })
         return user_id, winner_name, winner_email
+
+def paid_user_by_payment_for_number(conn, draw_id: int, number: int):
+    """Fallback por pagamentos aprovados do MESMO draw. Nao depende de numbers.status.
+
+    Retorna o comprador somente se houver exatamente um usuario distinto; mais de um
+    usuario e inconsistencia explicita (nunca escolhemos o primeiro da query)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT p.user_id, u.name, u.email
+              FROM public.payments p
+         LEFT JOIN public.users u ON u.id = p.user_id
+             WHERE p.draw_id = %s
+               AND %s = ANY(p.numbers)
+               AND lower(coalesce(p.status, '')) IN ('approved', 'paid', 'pago')
+               AND p.user_id IS NOT NULL
+        """, (draw_id, number))
+        rows = cur.fetchall() or []
+    owner_row = _single_owner_row(rows, draw_id, number, "payments")
+    if owner_row is None:
+        print("[winner] payment fallback found no buyer", {
+            "draw_id": draw_id,
+            "winner_number": number,
+        })
+        return None, None, None
+    user_id, winner_name, winner_email = _winner_identity_from_row(owner_row)
+    print("[winner] payment fallback resolved", {
+        "draw_id": draw_id,
+        "winner_number": number,
+        "winner_user_id": user_id,
+    })
+    return user_id, winner_name, winner_email
+
+
+# A regra automatica (ultima dezena sorteada da Lotomania) so e valida para a
+# grade 00-99 do sorteio. Nao existe regra definida para outras grades.
+SUPPORTED_RESULT_GRID_SIZE = 100
+SUPPORTED_RESULT_GRID_MIN = 0
+SUPPORTED_RESULT_GRID_MAX = 99
+
+
+def get_draw_number_grid(conn, draw_id: int):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*) AS total, MIN(n) AS min_n, MAX(n) AS max_n
+              FROM public.numbers
+             WHERE draw_id = %s
+        """, (draw_id,))
+        row = cur.fetchone() or {}
+    return {
+        "total": row.get("total"),
+        "min": row.get("min_n"),
+        "max": row.get("max_n"),
+    }
+
+
+def is_supported_result_grid(grid: dict) -> bool:
+    return (
+        grid.get("total") == SUPPORTED_RESULT_GRID_SIZE
+        and grid.get("min") == SUPPORTED_RESULT_GRID_MIN
+        and grid.get("max") == SUPPORTED_RESULT_GRID_MAX
+    )
+
 
 def winner_for_number(conn, draw_id: int, number: int):
     with conn.cursor() as cur:
@@ -404,12 +484,14 @@ def winner_for_number(conn, draw_id: int, number: int):
         })
 
         if number_status != "sold":
-            print("[winner] number is not sold", {
+            # Estado legado/inconsistente de numbers nao impede a resolucao quando
+            # um pagamento aprovado do mesmo draw comprova o comprador.
+            print("[winner] number is not sold; trying payment fallback", {
                 "draw_id": draw_id,
                 "winner_number": number,
                 "number_status": number_status,
             })
-            return None, None, None
+            return paid_user_by_payment_for_number(conn, draw_id, number)
 
         if reservation_id:
             cur.execute("""
@@ -431,18 +513,21 @@ def winner_for_number(conn, draw_id: int, number: int):
                 })
                 return user_id, winner_name, winner_email
 
-            print("[winner] reservation not resolved", {
+            print("[winner] reservation not resolved; trying payment fallback", {
                 "draw_id": draw_id,
                 "winner_number": number,
                 "reservation_id": reservation_id,
             })
-            return None, None, None
+            return paid_user_by_payment_for_number(conn, draw_id, number)
 
     print("[winner] sold number without reservation_id; using fallback", {
         "draw_id": draw_id,
         "winner_number": number,
     })
-    return paid_user_for_number_fallback(conn, draw_id, number)
+    legacy = paid_user_for_number_fallback(conn, draw_id, number)
+    if legacy[0] is not None:
+        return legacy
+    return paid_user_by_payment_for_number(conn, draw_id, number)
 
 def get_participants(conn, draw_id: int):
     """
@@ -526,6 +611,11 @@ def _parse_lotomania_payload(payload):
             )
         parsed_numbers.append(number)
 
+    if len(parsed_numbers) != 20 or len(set(parsed_numbers)) != 20:
+        raise RuntimeError(
+            "Resultado incompleto ou repetido: esperadas 20 dezenas distintas na ordem do sorteio"
+        )
+
     result_date = _parse_lotomania_result_date(payload.get("dataApuracao"))
     if result_date is None:
         raise RuntimeError("Data de apuração inválida no payload da Lotomania")
@@ -560,8 +650,27 @@ def get_lotomania_result(contest_number=None):
     else:
         requested_contest = None
 
-    r = requests.get(endpoint, timeout=20, headers={"Accept": "application/json"})
-    r.raise_for_status()
+    # Somente falhas transitórias da consulta pública são repetidas. Nunca
+    # trocamos de concurso/fonte nem usamos listaDezenas como ordem de extração.
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(endpoint, timeout=20, headers={"Accept": "application/json"})
+            r.raise_for_status()
+            break
+        except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            transient = isinstance(exc, (requests.Timeout, requests.ConnectionError)) or status in {
+                408, 425, 429, 500, 502, 503, 504,
+            }
+            if not transient or attempt == 3:
+                raise
+            print("[result] caixa_retry", {
+                "attempt": attempt,
+                "contest_number": requested_contest,
+                "status": status,
+                "error_type": type(exc).__name__,
+            })
+            retry_clock.sleep(attempt)
     result = _parse_lotomania_payload(r.json())
     if (
         requested_contest is not None
@@ -868,6 +977,24 @@ def _process_pending_draw(conn, draw: dict, lotomania_result: dict) -> bool:
         conn.rollback()
         return False
 
+    grid = get_draw_number_grid(conn, draw_id)
+    if not is_supported_result_grid(grid):
+        conn.rollback()
+        print("[result] unsupported_result_grid", {
+            "draw_id": draw_id,
+            "draw_type": draw_type,
+            "contest_number": contest_number,
+            "winner_number": winner_number,
+            "numbers_total": grid.get("total"),
+            "numbers_min": grid.get("min"),
+            "numbers_max": grid.get("max"),
+            "expected": "100 numeros, 0..99",
+        })
+        raise RuntimeError(
+            f"unsupported_result_grid draw_id={draw_id} "
+            f"total={grid.get('total')} min={grid.get('min')} max={grid.get('max')}"
+        )
+
     product_name = str(draw.get("product_name") or "").strip()
     draw_label = product_name or get_draw_label(conn, draw_id)
     winner_user_id, winner_name, winner_email = winner_for_number(
@@ -977,6 +1104,7 @@ def run():
         contest_cache = {
             int(lotomania_result["contest_number"]): lotomania_result,
         }
+        failed_draws = 0
 
         for draw in draws:
             try:
@@ -999,6 +1127,7 @@ def run():
                     continue
                 _process_pending_draw(conn, draw, eligible_result)
             except Exception as draw_exc:
+                failed_draws += 1
                 try:
                     conn.rollback()
                 except Exception:
@@ -1010,7 +1139,8 @@ def run():
                 })
 
         _run_push_automation_scan_safely(conn)
-        return 0
+        print("[result] run_summary", {"pending": len(draws), "failed": failed_draws})
+        return 1 if failed_draws else 0
     except Exception as exc:
         print("[run] erro:", repr(exc))
         try:

@@ -24,11 +24,11 @@ jobs:
       - name: Run script
         env:
           # ---- VARIÁVEIS COM VALORES PREENCHIDOS ----
-          POSTGRES_URL: "postgres://postgres.mgwvavsjxzwflibcjzhd:CtPrJ5nOpomcjuJV@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require&supa=base-pooler.x"
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
           SMTP_HOST: "smtp-relay.brevo.com"
           SMTP_PORT: "587"
-          SMTP_USER: "9712be001@smtp-brevo.com"
-          SMTP_PASS: "aVAwYKIWRD8hx47p"
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
 
           # ---- VARIÁVEIS NÃO SECRETAS ----
           COMMIT: "true"                         # "false" para dry-run (sem gravar no DB)

@@ -93,12 +93,16 @@ def lotomania(number=33, result_day=15, contest_number=2891, previous_contest_nu
     }
 
 
+VALID_GRID = {"total": 100, "min": 0, "max": 99}
+
+
 class ResultProcessingTests(unittest.TestCase):
-    def run_scenario(self, draws, winners=None, participants=None, update_counts=None, result=None):
+    def run_scenario(self, draws, winners=None, participants=None, update_counts=None, result=None, grids=None):
         conn = FakeConnection()
         winners = winners or {}
         participants = participants or {}
         update_counts = update_counts or {}
+        grids = grids or {}
         winner_calls = []
         update_calls = []
 
@@ -141,6 +145,11 @@ class ResultProcessingTests(unittest.TestCase):
                 main,
                 "lock_pending_draw_for_result",
                 side_effect=lambda _conn, draw_id: draws_by_id.get(draw_id),
+            ))
+            stack.enter_context(patch.object(
+                main,
+                "get_draw_number_grid",
+                side_effect=lambda _conn, draw_id: grids.get(draw_id, VALID_GRID),
             ))
             stack.enter_context(patch.object(main, "winner_for_number", side_effect=winner_lookup))
             stack.enter_context(patch.object(main, "set_draw_sorteado_any_status", side_effect=update_draw))
@@ -335,6 +344,7 @@ class ResultProcessingTests(unittest.TestCase):
              patch.object(main, "db", return_value=conn), \
              patch.object(main, "get_pending_draws", return_value=[draw(133)]), \
              patch.object(main.requests, "get", return_value=response), \
+             patch.object(main, "get_draw_number_grid", return_value=VALID_GRID), \
              patch.object(main, "winner_for_number", winner_mock), \
              patch.object(main, "set_draw_sorteado_any_status", update_mock), \
              patch.object(main, "_run_push_automation_scan_safely"):
@@ -460,6 +470,7 @@ class ResultProcessingTests(unittest.TestCase):
              patch.object(main, "get_last_lotomania_result", return_value=lotomania()), \
              patch.object(main, "resolve_first_eligible_lotomania_result", side_effect=lambda _draw, latest, **_kwargs: latest), \
              patch.object(main, "lock_pending_draw_for_result", return_value=draw(133)), \
+             patch.object(main, "get_draw_number_grid", return_value=VALID_GRID), \
              patch.object(main, "winner_for_number", return_value=(7, "Cliente A", "a@example.com")), \
              patch.object(main, "get_participants", return_value=[]), \
              patch.object(main, "get_draw_label", return_value="Principal"), \
@@ -481,6 +492,7 @@ class ResultProcessingTests(unittest.TestCase):
         communications_mock = Mock()
         with patch.object(main, "COMMIT", True), \
              patch.object(main, "lock_pending_draw_for_result", side_effect=[pending_draw, None]), \
+             patch.object(main, "get_draw_number_grid", return_value=VALID_GRID), \
              patch.object(main, "winner_for_number", winner_mock), \
              patch.object(main, "set_draw_sorteado_any_status", update_mock), \
              patch.object(main, "get_draw_label", return_value="Principal"), \
@@ -522,6 +534,7 @@ class ResultProcessingTests(unittest.TestCase):
              patch.object(main, "get_last_lotomania_result", return_value=lotomania()), \
              patch.object(main, "resolve_first_eligible_lotomania_result", side_effect=lambda _draw, latest, **_kwargs: latest), \
              patch.object(main, "lock_pending_draw_for_result", side_effect=[draw(133), draw(134, draw_type="adicional")]), \
+             patch.object(main, "get_draw_number_grid", return_value=VALID_GRID), \
              patch.object(main, "winner_for_number", return_value=(7, "Cliente", "winner@example.com")), \
              patch.object(main, "get_participants", return_value=[]), \
              patch.object(main, "get_draw_label", return_value="Sorteio"), \
@@ -589,8 +602,14 @@ class ResultProcessingTests(unittest.TestCase):
             "numero": "2891",
             "numeroConcursoAnterior": 2890,
             "dataApuracao": "15/07/2026",
-            "dezenasSorteadasOrdemSorteio": ["45", "02", "73", "19"],
-            "listaDezenas": ["02", "19", "45", "73"],
+            "dezenasSorteadasOrdemSorteio": [
+                "00", "01", "03", "04", "05", "06", "07", "08", "09", "10",
+                "11", "12", "13", "14", "15", "16", "45", "02", "73", "19",
+            ],
+            "listaDezenas": [
+                "00", "01", "02", "03", "04", "05", "06", "07", "08", "09",
+                "10", "11", "12", "13", "14", "15", "16", "19", "45", "73",
+            ],
         }
         with patch.object(main.requests, "get", return_value=response):
             result = main.get_last_lotomania_result()
@@ -608,8 +627,14 @@ class ResultProcessingTests(unittest.TestCase):
             "numero": 2890,
             "numeroConcursoAnterior": 2889,
             "dataApuracao": "13/07/2026",
-            "dezenasSorteadasOrdemSorteio": ["02", "45", "19"],
-            "listaDezenas": ["02", "19", "45"],
+            "dezenasSorteadasOrdemSorteio": [
+                "00", "01", "03", "04", "05", "06", "07", "08", "09", "10",
+                "11", "12", "13", "14", "15", "16", "17", "02", "45", "19",
+            ],
+            "listaDezenas": [
+                "00", "01", "02", "03", "04", "05", "06", "07", "08", "09",
+                "10", "11", "12", "13", "14", "15", "16", "17", "19", "45",
+            ],
         }
         with patch.object(main.requests, "get", return_value=response) as request_mock:
             result = main.get_lotomania_result(2890)

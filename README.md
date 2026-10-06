@@ -1,23 +1,27 @@
 
 # Lotomania Daily Checker (Python)
 
-Agendável (cron) para fechar um **sorteio aberto** na sua base conforme o **último** número sorteado da Lotomania (com fallback para o **penúltimo**).
+Agendável (cron) para apurar sorteios **fechados e ainda não realizados**, conforme a **última dezena na ordem de extração** da Lotomania.
 Funciona com Supabase Postgres (usa `POSTGRES_URL`).
 
 ## Como funciona
-1. Lê o **sorteio aberto** em `draws` (`status = 'open'`). Se houver mais de um, processa todos.
-2. Busca o resultado **mais recente** da Lotomania em JSON.
-3. Extrai os **2 últimos números na ordem do sorteio**.
-4. Calcula o **conjunto de números pagos** para cada draw, unindo:
-   - `reservations.status = 'paid'`
-   - `reservations JOIN payments ON payments.id = reservations.payment_id AND payments.status = 'approved'`
-5. Se o **último número** estiver pago, ele é o vencedor; senão tenta o **penúltimo**. (Controle por `CHECK_LAST_K`, padrão 2.)
-6. Em **modo dry‑run** (`COMMIT=false`), apenas loga o resultado. Em **modo commit** (`COMMIT=true`), atualiza `draws`.
+1. Lê todos os registros `draws.status = 'closed' AND realized_at IS NULL` dos tipos principal, adicional e secundario (tipo nulo é principal legado).
+2. Consulta o concurso mais recente e caminha pelo histórico até provar o primeiro concurso elegível após o fechamento. A comparação usa Brasília e 21h como horário de referência da apuração.
+3. Exige 20 dezenas distintas em `dezenasSorteadasOrdemSorteio`, no intervalo 00–99. Usa a última; não usa a lista ordenada numericamente nem tenta a penúltima.
+4. Procura o comprador pela reserva vinculada ao número `sold` do mesmo sorteio. Se a reserva não resolver, não houver reserva vinculada ou o número estiver em estado legado (`available`, `reserved` etc.), usa a participação paga de compatibilidade e, por fim, os pagamentos `approved`/`paid`/`pago` do MESMO sorteio que contenham o número. Zero usuários distintos: sem comprador. Um usuário distinto: é o comprador. Mais de um usuário distinto: erro `ambiguous_paid_owner`, o sorteio não é gravado e o processo retorna código 1. Várias linhas do mesmo usuário não são ambiguidade.
+5. Antes de apurar, exige a grade exata do sorteio: 100 números distintos em `public.numbers`, de 0 a 99. Qualquer outra grade (500, 1000, incompleta ou inconsistente) é recusada com o log `unsupported_result_grid`: nada é gravado, nenhuma comunicação é enviada, o sorteio conta como falha e os demais continuam. Não existe regra automática para outras grades.
+   Em seguida bloqueia e revalida o sorteio antes de gravar `status`, número, usuário, nome e `realized_at`. Não abre um novo sorteio.
+6. `COMMIT=false` executa a atualização em transação e faz rollback. Não envia comunicações de resultado. Desabilite também `PUSH_AUTOMATION_SCAN_ENABLED` em verificações sem envio: o scanner é independente do `COMMIT`.
+7. `COMMIT=true` confirma o resultado antes dos e-mails e evento de push. Falha de comunicação não desfaz o resultado.
+8. Timeout/conexão e HTTP transitório recebem até 3 tentativas, com pausas de 1s e 2s. Payload inválido, concurso incorreto e HTTP 404 não recebem fallback de fonte/concurso.
+9. Se qualquer sorteio falhar, os demais continuam sendo processados, mas o processo retorna código 1. Aguardar concurso ainda não elegível não é erro.
+
+Se a dezena não tiver comprador resolvido, o comportamento existente grava a dezena com usuário/nome nulos. Isso exige conferência de dados; não significa que outro número possa ser escolhido. Registros já marcados `sorteado` ficam fora da seleção, mesmo incompletos. Não reabra ou reconstrua resultados históricos sem validar fechamento, concurso e propriedade dos números.
 
 ## Variáveis de ambiente
 - `POSTGRES_URL` (obrigatório)
 - `COMMIT` (`true`/`false`; padrão `false`)
-- `CHECK_LAST_K` (padrão `2`)
+- `CHECK_LAST_K` é legado e não é lido pelo fluxo atual.
 - `LOTOMANIA_ENDPOINT` (padrão `https://servicebus2.caixa.gov.br/portaldeloterias/api/lotomania`)
 
 ### Push Automation
@@ -83,9 +87,19 @@ eventos ja vencidos sao bloqueados por padrao; backfill exige ativacao explicita
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-# copie .env.example para .env e edite
+# configure/exporte as variáveis do processo (main.py não carrega .env automaticamente)
+export COMMIT=false
+export PUSH_AUTOMATION_SCAN_ENABLED=false
 python main.py
 ```
+
+Testes locais, sem banco e sem envio:
+```bash
+python -m unittest discover -v
+```
+
+## Agendamento efetivo
+O workflow `.github/workflows/lotomania-result.yml` contém o cron D+1 às 10h de Brasília (terça, quinta e sábado). A existência desse YAML não prova execução: confira também o estado ativo/desabilitado em GitHub Actions. Os scanners de e-mail/push não executam a apuração da Caixa. O README abaixo descreve uma alternativa Render; não prova que exista um Cron Job provisionado. Evite dois agendadores concorrentes.
 
 ## Render (Cron Job)
 - Build: `pip install -r requirements.txt`
