@@ -32,6 +32,7 @@ KNOWN_AUTOMATION_EVENT_KEYS = (
     "BALANCE_EXPIRED",
 )
 WINNER_TEMPORAL_COLUMNS = (
+    "realized_at",
     "winner_defined_at",
     "drawn_at",
     "finished_at",
@@ -895,6 +896,12 @@ def emit_winner_defined_events(conn, ctx: dict):
         return summary
 
     base_where = f"status = 'sorteado' AND ({' OR '.join(defined_conditions)})"
+    # Somente principal (NULL = principal legado). Adicionais/secundarios sao tratados
+    # exclusivamente por emit_additional_winner_defined_events (additional_draw:<id>:...).
+    principal_filter = ""
+    if "draw_type" in draws_cols:
+        principal_filter = " AND COALESCE(draw_type, 'principal') = 'principal'"
+        base_where += principal_filter
     params = []
     if ctx["config"]["no_backfill"] and temporal_col:
         base_where += f" AND {_quote_ident(temporal_col)} >= NOW() - (%s * INTERVAL '1 hour')"
@@ -915,7 +922,7 @@ def emit_winner_defined_events(conn, ctx: dict):
                 SELECT COUNT(*) AS ignored_count
                   FROM draws
                  WHERE status = 'sorteado'
-                   AND ({' OR '.join(defined_conditions)})
+                   AND ({' OR '.join(defined_conditions)}){principal_filter}
                    AND ({_quote_ident(temporal_col)} IS NULL
                         OR {_quote_ident(temporal_col)} < NOW() - (%s * INTERVAL '1 hour'))
             """, (ctx["config"]["winner_lookback_hours"],))
