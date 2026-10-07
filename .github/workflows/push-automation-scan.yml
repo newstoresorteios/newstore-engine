@@ -32,7 +32,6 @@ jobs:
           POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
           PUSH_AUTOMATION_SCAN_ENABLED: "true"
           PUSH_AUTOMATION_EVENTS_ENABLED: "true"
-          PUSH_AUTOMATION_WINNER_LOOKBACK_HOURS: "1"
           BACKEND_INTERNAL_API_BASE: ${{ secrets.BACKEND_INTERNAL_API_BASE }}
           PUSH_INTERNAL_EVENTS_TOKEN: ${{ secrets.PUSH_INTERNAL_EVENTS_TOKEN }}
         run: python run_push_automation_scan.py
