@@ -14,6 +14,7 @@ from email_automation_events import (
 from email_automation_scan import (
     EMAIL_BALANCE_EXPIRING_EVENTS,
     EMAIL_CLOSED_LOOKBACK_HOURS,
+    EMAIL_RESULT_LOOKBACK_HOURS,
     EMAIL_DEFAULT_LOOKBACK_HOURS,
     EMAIL_PUBLISHED_LOOKBACK_HOURS,
     EMAIL_REMAINING_THRESHOLDS,
@@ -572,6 +573,8 @@ class EmailAutomationScanTest(unittest.TestCase):
         draw_queries = [
             sql for sql, _params in conn.executions if "FROM public.draws" in sql
         ]
+        # publicados, vagas restantes e encerrados; resultados ficam desligados (fail-closed) sem
+        # EMAIL_RESULT_AUTOMATION_EFFECTIVE_FROM
         self.assertEqual(len(draw_queries), 3)
         for query in draw_queries:
             self.assertIn(
@@ -581,6 +584,7 @@ class EmailAutomationScanTest(unittest.TestCase):
         self.assertEqual(EMAIL_DEFAULT_LOOKBACK_HOURS, 24)
         self.assertEqual(EMAIL_PUBLISHED_LOOKBACK_HOURS, 24)
         self.assertEqual(EMAIL_CLOSED_LOOKBACK_HOURS, 72)
+        self.assertEqual(EMAIL_RESULT_LOOKBACK_HOURS, 168)
 
     def test_one_backend_failure_does_not_stop_other_batch_events(self):
         opened_at = datetime.now(timezone.utc)

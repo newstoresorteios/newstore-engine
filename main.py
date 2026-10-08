@@ -8,6 +8,12 @@ import time as retry_clock
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from push_automation_events import notify_push_automation_event
+from email_automation_events import (
+    notify_email_automation_event,
+    result_email_effective_from,
+    result_email_event_keys,
+    result_email_reference_key,
+)
 from push_automation_scan import run_push_automation_scan
 
 # >>> utilidades para limpar a URL do Postgres e mascarar senha nos logs
@@ -18,6 +24,19 @@ import re
 # --------- ENV ---------
 DB_URL = os.getenv("POSTGRES_URL", "")
 COMMIT = os.getenv("COMMIT", "false").lower() in ("1", "true", "yes")
+
+
+def _result_emails_owned_by_backend(now=None) -> bool:
+    """Um unico responsavel pelo envio dos e-mails de resultado.
+
+    Com EMAIL_RESULT_AUTOMATION_EFFECTIVE_FROM valido e ja alcancado, o backend (notification_dispatches:
+    registro por destinatario, dedupe e reenvio de falhas) e o dono e o engine NAO usa SMTP proprio. Sem o
+    corte vale o caminho SMTP legado e nada e publicado. A mesma variavel liga o scanner, entao os dois
+    caminhos nunca ficam ativos ao mesmo tempo."""
+    cutoff = result_email_effective_from()
+    if cutoff is None:
+        return False
+    return (now or datetime.now(timezone.utc)) >= cutoff
 LOT_ENDPOINT = os.getenv("LOTOMANIA_ENDPOINT", "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotomania")
 try:
     BRASILIA_TZ = ZoneInfo("America/Sao_Paulo")
@@ -846,6 +865,50 @@ def _log_email_failure(draw_id: int, category: str, error):
     print("[email] send_failed", details)
 
 
+def _publish_result_email_events(draw: dict, winner_user_id, contest_number=None, result_date=None):
+    """Publica os eventos de e-mail de resultado no backend (unico remetente).
+
+    Falhas aqui NAO desfazem o resultado: o scanner de e-mail reapresenta os mesmos eventos
+    (mesma chave de dedupe) enquanto o sorteio estiver na janela de recuperacao."""
+    draw_id = int(draw["id"])
+    draw_type = _normalize_result_draw_type(draw.get("draw_type"))
+    group = "additional_draw" if draw_type == "adicional" else "draw"
+    metadata = {"draw_id": draw_id, "draw_type": draw_type}
+    if contest_number is not None:
+        metadata["contest_number"] = int(contest_number)
+    if hasattr(result_date, "isoformat"):
+        metadata["result_date"] = result_date.isoformat()
+    outcomes = {}
+    for event_key in result_email_event_keys(winner_user_id is not None):
+        reference_key = result_email_reference_key(group, draw_id, event_key)
+        try:
+            response = notify_email_automation_event(
+                event_key=event_key,
+                reference_type=group,
+                reference_key=reference_key,
+                metadata=metadata,
+            )
+            ok = isinstance(response, dict) and response.get("ok") is True
+            outcomes[event_key] = "published" if ok else "failed"
+            if not ok:
+                print("[email-result] event_publish_failed", {
+                    "draw_id": draw_id,
+                    "event_key": event_key,
+                    "reason": (response or {}).get("reason") if isinstance(response, dict) else None,
+                    "recovery": "email_scan_will_retry",
+                })
+        except Exception as exc:
+            outcomes[event_key] = "failed"
+            print("[email-result] event_publish_failed", {
+                "draw_id": draw_id,
+                "event_key": event_key,
+                "error_type": exc.__class__.__name__,
+                "recovery": "email_scan_will_retry",
+            })
+    print("[email-result] backend_events", {"draw_id": draw_id, **outcomes})
+    return outcomes
+
+
 def _send_result_communications(
     draw: dict,
     draw_label: str,
@@ -854,6 +917,8 @@ def _send_result_communications(
     winner_name,
     winner_email,
     loser_list,
+    contest_number=None,
+    result_date=None,
 ):
     draw_id = int(draw["id"])
     summary = {
@@ -880,6 +945,21 @@ def _send_result_communications(
             "reference_key": winner_event["reference_key"],
             "message": str(event_exc) or "event_failed",
         })
+
+    if _result_emails_owned_by_backend():
+        # Um unico responsavel pelo envio: o backend. Sem SMTP proprio do engine.
+        summary["mode"] = "backend"
+        summary["events"] = _publish_result_email_events(
+            draw, winner_user_id, contest_number, result_date
+        )
+        print("[email] result_delivery_summary", {"draw_id": draw_id, **summary})
+        return summary
+
+    if winner_user_id is None:
+        # Sem comprador identificado nao ha parabens e os participantes nao recebem
+        # "nao contemplado" nem "Vencedor: -".
+        print("[email] result_without_buyer_no_participant_emails", {"draw_id": draw_id})
+        loser_list = []
 
     if winner_user_id and winner_email:
         try:
@@ -1043,7 +1123,8 @@ def _process_pending_draw(conn, draw: dict, lotomania_result: dict) -> bool:
         "status": "sorteado",
     })
     try:
-        participants = get_participants(conn, draw_id)
+        # Com o envio pelo backend os participantes sao resolvidos la; nao e necessario carregar a lista.
+        participants = [] if _result_emails_owned_by_backend() else get_participants(conn, draw_id)
         loser_list = [
             participant
             for participant in participants
@@ -1068,6 +1149,8 @@ def _process_pending_draw(conn, draw: dict, lotomania_result: dict) -> bool:
         winner_name,
         winner_email,
         loser_list,
+        contest_number=contest_number,
+        result_date=lotomania_result.get("result_date"),
     )
     return True
 

@@ -2,7 +2,12 @@ import os
 import secrets
 from datetime import date, datetime, time, timezone
 
-from email_automation_events import notify_email_automation_event
+from email_automation_events import (
+    notify_email_automation_event,
+    result_email_effective_from,
+    result_email_event_keys,
+    result_email_reference_key,
+)
 
 
 EMAIL_REMAINING_THRESHOLDS = (
@@ -21,6 +26,14 @@ EMAIL_BALANCE_EXPIRING_EVENTS = {
 EMAIL_DEFAULT_LOOKBACK_HOURS = 24
 EMAIL_PUBLISHED_LOOKBACK_HOURS = 24
 EMAIL_CLOSED_LOOKBACK_HOURS = 72
+# Resultado: o scanner reapresenta o evento enquanto o sorteio estiver dentro da janela; o backend
+# dedupe por destinatario (notification_dispatches) e reenvia somente falhas/pending abandonado.
+# Mantida abaixo do limite de idade do backend (NOTIFICATION_EMAIL_RESULT_MAX_AGE_HOURS, 192h).
+EMAIL_RESULT_LOOKBACK_HOURS = 168
+# Alem da janela, somente os eventos CRITICOS (vencedor e administracao) continuam sendo apresentados por
+# mais este periodo: se ainda estiverem pendentes, o backend registra uma falha definitiva e sinaliza uma vez.
+EMAIL_RESULT_EXPIRY_SWEEP_HOURS = 72
+RESULT_CRITICAL_EVENT_KEYS = ("EMAIL_RESULT_WINNER", "EMAIL_RESULT_ADMIN")
 
 
 def _env_true(name: str, default: bool = False) -> bool:
@@ -199,6 +212,82 @@ def _load_closed_draws(conn, lookback_hours: int):
              ORDER BY d.id
         """, (lookback_hours,))
         return cur.fetchall() or []
+
+
+def _result_effective_from():
+    """Corte dos e-mails de resultado (fail-closed): sem valor valido nada de resultado e publicado.
+
+    Segunda trava, independente de NOTIFICATION_EMAIL_RESULT_EFFECTIVE_FROM no backend: sorteios
+    realizados antes do corte (backfills, historico) nunca geram evento."""
+    # valor ausente ou invalido desliga somente os e-mails de resultado; os demais eventos seguem
+    return result_email_effective_from()
+
+
+def _load_result_draws(conn, lookback_hours: int, effective_from):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT d.id,
+                   d.status,
+                   COALESCE(d.draw_type, 'principal') AS draw_type,
+                   NULLIF(BTRIM(to_jsonb(d)->>'product_name'), '') AS product_name,
+                   COALESCE(
+                       NULLIF(BTRIM(to_jsonb(d)->>'product_name'), ''),
+                       NULLIF(BTRIM(to_jsonb(d)->>'name'), ''),
+                       NULLIF(BTRIM(to_jsonb(d)->>'title'), '')
+                   ) AS draw_name,
+                   NULLIF(BTRIM(to_jsonb(d)->>'description'), '') AS draw_description,
+                   NULLIF(BTRIM(to_jsonb(d)->>'banner_title'), '') AS banner_title,
+                   d.winner_number,
+                   d.winner_user_id,
+                   d.realized_at
+              FROM public.draws d
+             WHERE d.status = 'sorteado'
+               AND d.realized_at IS NOT NULL
+               AND d.realized_at >= NOW() - (%s * INTERVAL '1 hour')
+               AND d.realized_at >= %s
+               AND d.winner_number IS NOT NULL
+               AND COALESCE(d.draw_type, 'principal') IN (
+                   'principal',
+                   'adicional',
+                   'secundario'
+               )
+             ORDER BY d.id
+        """, (lookback_hours, effective_from))
+        return cur.fetchall() or []
+
+
+def _result_candidates(draw: dict, now=None, lookback_hours=None):
+    """Eventos de e-mail de resultado de um sorteio realizado.
+
+    Sem comprador identificado (winner_user_id nulo) somente a administracao e avisada: nao ha
+    parabens e os participantes nao sao informados de "nao contemplado".
+    Passada a janela de republicacao, somente os eventos criticos seguem (varredura de expiracao)."""
+    draw_id = int(draw["id"])
+    group = _draw_group(draw.get("draw_type"))
+    identified = draw.get("winner_user_id") is not None
+    realized_at = _as_utc_datetime(draw.get("realized_at"))
+    sweep_only = bool(
+        now is not None
+        and lookback_hours is not None
+        and realized_at is not None
+        and (now - realized_at).total_seconds() > lookback_hours * 3600
+    )
+    candidates = []
+    for event_key in result_email_event_keys(identified):
+        if sweep_only and event_key not in RESULT_CRITICAL_EVENT_KEYS:
+            continue
+        candidates.append({
+            "kind": "result",
+            "event_key": event_key,
+            "reference_type": group,
+            "reference_key": result_email_reference_key(group, draw_id, event_key),
+            "metadata": _draw_metadata(
+                draw,
+                extra={"winner_identified": identified, "expiry_sweep": sweep_only},
+            ),
+            "occurred_at": draw.get("realized_at"),
+        })
+    return candidates
 
 
 def _load_balance_rows(conn):
@@ -440,6 +529,19 @@ def _record_event(summary, event_key, result):
     _add_delivery_counts(summary, result)
 
 
+def _log_critical_result_failure(candidate, result):
+    """Falha definitiva (tentativas esgotadas ou janela vencida): o backend responde critical_failure e o
+    job termina com falha. Registra sorteio e tipo, sem dados pessoais."""
+    data = result.get("data") if isinstance(result, dict) else None
+    if isinstance(data, dict) and data.get("status") == "critical_failure":
+        print("[email-automation] critical_result_notification_failed", {
+            "draw_id": candidate["metadata"].get("draw_id"),
+            "event_key": candidate["event_key"],
+            "reference_key": candidate["reference_key"],
+            "alerts": _nonnegative_count(data.get("critical_alerts")),
+        })
+
+
 def _record_balance_event(summary, event_key, result):
     summary["balance_events"] += 1
     is_dry_run = isinstance(result, dict) and result.get("dry_run")
@@ -592,6 +694,10 @@ def run_email_automation_scan(
         "EMAIL_AUTOMATION_CLOSED_LOOKBACK_HOURS",
         EMAIL_CLOSED_LOOKBACK_HOURS,
     )
+    result_lookback_hours = _env_int(
+        "EMAIL_AUTOMATION_RESULT_LOOKBACK_HOURS",
+        EMAIL_RESULT_LOOKBACK_HOURS,
+    )
     summary = {
         "ok": True,
         "dry_run": dry_run,
@@ -599,6 +705,7 @@ def run_email_automation_scan(
         "published_checked": 0,
         "remaining_checked": 0,
         "closed_checked": 0,
+        "result_checked": 0,
         "balance_checked": 0,
         "balance_with_valid_expiry": 0,
         "balance_eligible": 0,
@@ -674,6 +781,23 @@ def run_email_automation_scan(
         })
         summary["closed_checked"] += 1
 
+    result_effective_from = _result_effective_from()
+    result_sweep_hours = _env_int(
+        "EMAIL_AUTOMATION_RESULT_EXPIRY_SWEEP_HOURS",
+        EMAIL_RESULT_EXPIRY_SWEEP_HOURS,
+    )
+    if result_effective_from is None:
+        # fail-closed: sem EMAIL_RESULT_AUTOMATION_EFFECTIVE_FROM valido nenhum e-mail de resultado e publicado
+        summary["result_disabled"] = True
+    else:
+        for draw in _load_result_draws(
+            conn,
+            result_lookback_hours + result_sweep_hours,
+            result_effective_from,
+        ):
+            candidates.extend(_result_candidates(draw, scan_time, result_lookback_hours))
+            summary["result_checked"] += 1
+
     try:
         candidates.extend(_build_balance_candidates(conn, summary, scan_time))
     except Exception as exc:
@@ -703,6 +827,8 @@ def run_email_automation_scan(
             _record_balance_event(summary, candidate["event_key"], result)
         else:
             _record_event(summary, candidate["event_key"], result)
+            if candidate["kind"] == "result":
+                _log_critical_result_failure(candidate, result)
 
     summary["ok"] = summary["failed"] == 0
     return summary
