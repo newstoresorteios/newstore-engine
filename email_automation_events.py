@@ -1,5 +1,6 @@
 import os
 import time
+from datetime import datetime, timezone
 
 import requests
 
@@ -11,6 +12,42 @@ RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 DEDUPE_STATUS_CODES = {409}
 DEFAULT_BACKEND_CONNECT_TIMEOUT_SECONDS = 10
 DEFAULT_BACKEND_READ_TIMEOUT_SECONDS = 45
+
+# E-mails de resultado: o backend e o unico remetente (notification_dispatches). Chaves compartilhadas
+# pelo scanner e pelo main.py para que ambos produzam exatamente a mesma chave de dedupe.
+RESULT_EMAIL_EVENT_SUFFIXES = {
+    "EMAIL_RESULT_WINNER": "result_winner_email",
+    "EMAIL_RESULT_PARTICIPANT": "result_participant_email",
+    "EMAIL_RESULT_ADMIN": "result_admin_email",
+}
+
+
+def result_email_reference_key(group: str, draw_id: int, event_key: str) -> str:
+    return f"{group}:{int(draw_id)}:{RESULT_EMAIL_EVENT_SUFFIXES[event_key]}"
+
+
+def result_email_effective_from():
+    """Instante de corte da ativacao dos e-mails de resultado (fail-closed).
+
+    E a UNICA chave que decide quem envia: com o corte valido o backend e o dono dos e-mails de
+    resultado (o engine nao usa SMTP proprio e o scanner publica os eventos); sem ele vale o caminho
+    SMTP legado e nada e publicado. Valor ausente ou invalido => None."""
+    raw = os.getenv("EMAIL_RESULT_AUTOMATION_EFFECTIVE_FROM", "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        print("[email-automation] result_effective_from_invalid", {"disabled": True})
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def result_email_event_keys(winner_identified: bool):
+    """Sem comprador identificado so a administracao e avisada (sem parabens e sem 'nao contemplado')."""
+    if winner_identified:
+        return ["EMAIL_RESULT_WINNER", "EMAIL_RESULT_PARTICIPANT", "EMAIL_RESULT_ADMIN"]
+    return ["EMAIL_RESULT_ADMIN"]
 
 
 def _positive_int_env(name, default):

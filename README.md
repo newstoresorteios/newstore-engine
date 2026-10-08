@@ -18,6 +18,20 @@ Funciona com Supabase Postgres (usa `POSTGRES_URL`).
 
 Se a dezena não tiver comprador resolvido, o comportamento existente grava a dezena com usuário/nome nulos. Isso exige conferência de dados; não significa que outro número possa ser escolhido. Registros já marcados `sorteado` ficam fora da seleção, mesmo incompletos. Não reabra ou reconstrua resultados históricos sem validar fechamento, concurso e propriedade dos números.
 
+## E-mails de resultado (vencedor, administração e não contemplados)
+**Uma única chave decide quem envia:** a variável do repositório `EMAIL_RESULT_AUTOMATION_EFFECTIVE_FROM` (data/hora ISO), passada ao `lotomania-result` e ao `email-automation-scan`.
+- **Sem a variável (padrão) ou com valor inválido ou futuro:** vale o caminho SMTP legado do `main.py` e nada é publicado.
+- **Com o corte alcançado:** o backend é o único remetente. O `main.py` não usa SMTP e publica `EMAIL_RESULT_WINNER`, `EMAIL_RESULT_PARTICIPANT` e `EMAIL_RESULT_ADMIN` (somente a administração quando não há comprador identificado) em `/api/internal/email/events`, com o concurso da Caixa utilizado; o `email-automation-scan` reapresenta os mesmos eventos. Os dois caminhos nunca ficam ativos juntos.
+
+Recuperação e deduplicação (tabelas `notification_dispatches` e `notification_campaigns`, sem migration):
+- um despacho por destinatário e a mesma chave de dedupe (`draw:<id>:result_*_email` / `additional_draw:<id>:...`); o que já foi aceito nunca é reenviado;
+- o scanner republica por **168h** (`EMAIL_AUTOMATION_RESULT_LOOKBACK_HOURS`) e o backend aceita por **192h** (`NOTIFICATION_EMAIL_RESULT_MAX_AGE_HOURS`);
+- falhas são reenviadas, `pending` abandonados (mais de 20 minutos) são recuperados uma vez e há no máximo **5 tentativas** por destinatário;
+- **falha definitiva** do vencedor ou da administração (5 tentativas esgotadas ou janela vencida sem entrega): o backend grava um registro persistente (`payload.final_failure`), responde `critical_failure` e o job do scanner termina com erro **uma única vez**; depois disso não há novo alerta nem reenvio automático. Passada a janela de 168h, o scanner segue apresentando por mais 72h (`EMAIL_AUTOMATION_RESULT_EXPIRY_SWEEP_HOURS`) somente os eventos críticos para que isso seja detectado. Participantes que esgotam as tentativas apenas ficam em log.
+
+Proteção contra e-mails de sorteios antigos (dupla trava, fail-closed): o mesmo instante de corte deve ser definido em `EMAIL_RESULT_AUTOMATION_EFFECTIVE_FROM` (engine) e em `NOTIFICATION_EMAIL_RESULT_EFFECTIVE_FROM` (backend). Resultados realizados antes do corte nunca geram e-mail, e se uma das duas faltar ou for inválida nenhum e-mail de resultado é enviado.
+Para publicar eventos, o `lotomania-result` usa `BACKEND_INTERNAL_API_BASE` e `PUSH_INTERNAL_EVENTS_TOKEN` (Secrets).
+
 ## Variáveis de ambiente
 - `POSTGRES_URL` (obrigatório)
 - `COMMIT` (`true`/`false`; padrão `false`)

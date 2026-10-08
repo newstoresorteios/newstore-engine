@@ -36,6 +36,10 @@ jobs:
           SMTP_PORT: "587"
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          # E-mails de resultado pelo backend: so passam a valer quando a variavel de corte for definida
+          EMAIL_RESULT_AUTOMATION_EFFECTIVE_FROM: ${{ vars.EMAIL_RESULT_AUTOMATION_EFFECTIVE_FROM }}
+          BACKEND_INTERNAL_API_BASE: ${{ secrets.BACKEND_INTERNAL_API_BASE }}
+          PUSH_INTERNAL_EVENTS_TOKEN: ${{ secrets.PUSH_INTERNAL_EVENTS_TOKEN }}
 
           COMMIT: "true"
           SMTP_NAME: "NewStore Sorteios"
