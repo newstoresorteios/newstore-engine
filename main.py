@@ -19,6 +19,7 @@ from push_automation_scan import run_push_automation_scan
 # >>> utilidades para limpar a URL do Postgres e mascarar senha nos logs
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import re
+import secrets
 # <<<
 
 # --------- ENV ---------
@@ -830,6 +831,9 @@ def _winner_defined_event(draw: dict, winner_number: int, winner_user_id, winner
     draw_id = int(draw["id"])
     draw_type = _normalize_result_draw_type(draw.get("draw_type"))
     is_additional = draw_type == "adicional"
+    realized_at = draw.get("realized_at")
+    if not isinstance(realized_at, datetime):
+        raise RuntimeError("realized_at ausente para publicar resultado")
     metadata = {
         "draw_id": draw_id,
         "draw_type": draw_type,
@@ -850,6 +854,8 @@ def _winner_defined_event(draw: dict, winner_number: int, winner_user_id, winner
             else f"draw:{draw_id}:winner_defined"
         ),
         "metadata": metadata,
+        "occurred_at": realized_at.isoformat(),
+        "scan_id": f"result-run:{draw_id}:{secrets.token_hex(8)}",
     }
 
 
@@ -926,13 +932,8 @@ def _send_result_communications(
         "admin_email": "skipped",
         "loser_emails": {"sent": 0, "failed": 0},
     }
-    winner_event = _winner_defined_event(
-        draw,
-        winner_number,
-        winner_user_id,
-        winner_name,
-    )
     try:
+        winner_event = _winner_defined_event(draw, winner_number, winner_user_id, winner_name)
         response = notify_push_automation_event(**winner_event)
         if isinstance(response, dict) and response.get("ok") is False:
             print("[push-automation] winner_defined not sent:", {
@@ -942,7 +943,7 @@ def _send_result_communications(
             })
     except Exception as event_exc:
         print("[push-automation] winner_defined failed after commit:", {
-            "reference_key": winner_event["reference_key"],
+            "draw_id": draw_id,
             "message": str(event_exc) or "event_failed",
         })
 
@@ -1122,6 +1123,21 @@ def _process_pending_draw(conn, draw: dict, lotomania_result: dict) -> bool:
         "winner_user_id": winner_user_id,
         "status": "sorteado",
     })
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT realized_at FROM public.draws WHERE id = %s", (draw_id,))
+            persisted = cur.fetchone() or {}
+        draw = {**draw, "realized_at": persisted.get("realized_at")}
+    except Exception as timestamp_exc:
+        # Resultado ja confirmado; nao inventar data nem impedir os e-mails existentes.
+        print("[push-automation] realization_timestamp_unavailable", {
+            "draw_id": draw_id, "error_type": timestamp_exc.__class__.__name__,
+            "recovery": "push_scan_will_retry",
+        })
+        try:
+            conn.rollback()
+        except Exception:
+            pass
     try:
         # Com o envio pelo backend os participantes sao resolvidos la; nao e necessario carregar a lista.
         participants = [] if _result_emails_owned_by_backend() else get_participants(conn, draw_id)

@@ -67,6 +67,7 @@ PAYMENT_TEMPORAL_COLUMNS = (
 def run_push_automation_scan(conn):
     config = _scan_config()
     ctx = _new_scan_context(config)
+    ctx["conn"] = conn
     print("[push-automation] scan:start", _scan_config_snapshot(config, ctx["scan_id"]))
 
     remaining_summary = emit_remaining_numbers_events(conn, ctx)
@@ -81,7 +82,7 @@ def run_push_automation_scan(conn):
     print("[push-automation] scan:summary", final_summary)
 
     return {
-        "ok": True,
+        "ok": not ctx.get("publish_failed", False),
         "scan_id": ctx["scan_id"],
         "remaining_numbers_checked": remaining_summary["checked"],
         "additional_remaining_numbers_checked": additional_remaining_summary["checked"],
@@ -556,106 +557,96 @@ def _notify_event(ctx: dict, candidate: dict):
         return {"ok": False, "reason": "event_failed"}
 
 
-def _process_candidates(
-    ctx: dict,
-    candidates: list[dict],
-    checked: int,
-    group: str,
-    specific_max_by_key: dict[str, int] | None = None,
-    group_max_events: int | None = None,
-) -> dict:
+def _completed_event_references(conn, event_key):
+    if conn is None or "dedupe_key" not in _table_columns(conn, "notification_event_ledger"):
+        return set()
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT entity_id AS reference_key FROM public.notification_event_ledger
+             WHERE channel = 'push' AND mode = 'production'
+               AND event_key = %s AND status = 'sent'
+               AND COALESCE(meta->>'failed', '0') = '0'
+        """, (event_key,))
+        return {row["reference_key"] for row in cur.fetchall() if row.get("reference_key")}
+
+
+def _event_last_attempts(conn, event_key):
+    if conn is None or "dedupe_key" not in _table_columns(conn, "notification_event_ledger"):
+        return {}
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT entity_id AS reference_key,
+                   COALESCE(meta->>'processing_started_at', created_at::text) AS attempted_at
+              FROM public.notification_event_ledger
+             WHERE channel = 'push' AND mode = 'production' AND event_key = %s
+        """, (event_key,))
+        return {row["reference_key"]: row.get("attempted_at") for row in cur.fetchall() if row.get("reference_key")}
+
+
+def _process_candidates(ctx, candidates, checked, group, specific_max_by_key=None, group_max_events=None):
     specific_max_by_key = specific_max_by_key or {}
     results = []
-    if (
-        group_max_events is not None
-        and not ctx["config"]["allow_large_batch"]
-        and len(candidates) > group_max_events
-    ):
-        event_key = "BALANCE_*" if group == "balance_expiration" else (candidates[0]["event_key"] if candidates else group)
-        results = _block_large_batch(
-            ctx,
-            event_key,
-            len(candidates),
-            group_max_events,
-            f"{group}_max_events_per_scan",
-        )
-        summary = _summary_from_results(checked, results)
-        _log_group_done(group, summary)
-        return summary
-
-    grouped = defaultdict(list)
-    for candidate in candidates:
-        grouped[candidate["event_key"]].append(candidate)
-
-    for event_key, event_candidates in grouped.items():
-        block = _large_batch_block_reason(
-            ctx,
-            event_key,
-            len(event_candidates),
-            specific_max_by_key.get(event_key),
-        )
-        if block:
-            reason, max_allowed = block
-            results.extend(_block_large_batch(
-                ctx,
-                event_key,
-                len(event_candidates),
-                max_allowed,
-                reason,
-            ))
+    group_attempted = 0
+    completed = ctx.setdefault("completed_references", {})
+    attempt_cache = ctx.setdefault("last_attempts", {})
+    for key in {candidate["event_key"] for candidate in candidates}:
+        if key not in attempt_cache:
+            attempt_cache[key] = _event_last_attempts(ctx.get("conn"), key)
+    # Unattempted first, then least recently attempted: permanent failures cannot starve new results.
+    def priority(candidate):
+        last = _normalize_datetime(attempt_cache[candidate["event_key"]].get(candidate["reference_key"]))
+        return (last.timestamp() if last else 0, _iso_datetime(candidate.get("occurred_at")) or "", candidate["reference_key"])
+    ordered = sorted(candidates, key=priority)
+    for candidate in ordered:
+        key, reference = candidate["event_key"], candidate["reference_key"]
+        occurred = candidate.get("occurred_at")
+        _record(ctx, key, "events_candidates")
+        if key not in completed:
+            completed[key] = _completed_event_references(ctx.get("conn"), key)
+        if reference in completed[key] or not _event_key_allowed(key):
+            _record(ctx, key, "events_skipped")
+            results.append({"skipped": True})
             continue
-
-        _record(ctx, event_key, "events_candidates", len(event_candidates))
-        for candidate in event_candidates:
-            reference_key = candidate["reference_key"]
-            occurred_at = candidate.get("occurred_at")
-
-            if not _event_key_allowed(event_key):
-                print("[push-automation] skipped: event key not allowed", {
-                    "event_key": event_key,
-                    "reference_key": reference_key,
-                })
-                _record(ctx, event_key, "events_skipped")
-                results.append({"skipped": True, "reason": "event_key_not_allowed"})
+        if ctx["config"]["require_occurred_at"] and _normalize_datetime(occurred) is None:
+            _log_missing_occurred_at(key, reference, "require_occurred_at")
+            _record(ctx, key, "events_skipped")
+            results.append({"skipped": True})
+            continue
+        if not ctx["config"]["allow_large_batch"]:
+            key_count = ctx["events_by_key"][key]["events_attempted"]
+            total = sum(v["events_attempted"] for v in ctx["events_by_key"].values())
+            cap = _max_allowed_for_key(ctx, key, specific_max_by_key.get(key))
+            if (key_count >= cap or total >= ctx["config"]["max_events_per_scan"]
+                    or (group_max_events is not None and group_attempted >= group_max_events)):
+                _record(ctx, key, "events_blocked")
+                print("[push-automation] batch_deferred", {"event_key": key, "reference_key": reference})
+                results.append({"blocked": True, "reason": "batch_limit_deferred"})
                 continue
-
-            if ctx["config"]["require_occurred_at"] and _normalize_datetime(occurred_at) is None:
-                _log_missing_occurred_at(event_key, reference_key, "require_occurred_at")
-                _record(ctx, event_key, "events_skipped")
-                results.append({"skipped": True, "reason": "missing_occurred_at"})
-                continue
-
-            if ctx["config"]["preview_only"]:
-                print("[push-automation] preview:event_candidate", {
-                    "event_key": event_key,
-                    "reference_type": candidate["reference_type"],
-                    "reference_key": reference_key,
-                    "occurred_at": _iso_datetime(occurred_at),
-                    "scan_id": ctx["scan_id"],
-                })
-                results.append({"preview": True})
-                continue
-
-            _record(ctx, event_key, "events_attempted")
-            response = _notify_event(ctx, candidate)
-            attempted = True
-            skipped = bool(response.get("skipped")) if isinstance(response, dict) else False
-            sent_to_backend = (
-                isinstance(response, dict)
-                and response.get("ok") is True
-                and not skipped
-                and not response.get("blocked")
-            )
-            if skipped:
-                _record(ctx, event_key, "events_skipped")
-            if sent_to_backend:
-                _record(ctx, event_key, "events_sent_to_backend")
-            results.append({
-                "attempted": attempted,
-                "skipped": skipped,
-                "sent_to_backend": sent_to_backend,
+        if ctx["config"]["preview_only"]:
+            print("[push-automation] preview:event_candidate", {
+                "event_key": key, "reference_type": candidate["reference_type"],
+                "reference_key": reference, "occurred_at": _iso_datetime(occurred), "scan_id": ctx["scan_id"],
             })
-
+            results.append({"preview": True})
+            continue
+        _record(ctx, key, "events_attempted")
+        group_attempted += 1
+        response = _notify_event(ctx, candidate)
+        data = response.get("data") if isinstance(response, dict) else None
+        status = data.get("status") if isinstance(data, dict) else None
+        skipped = bool(response.get("skipped")) if isinstance(response, dict) else False
+        skipped = skipped or status in {"skipped", "deduped", "dry_run"}
+        failed = not isinstance(response, dict) or response.get("ok") is not True or response.get("blocked") is True
+        failed = bool(failed or status in {"failed", "partial_failure"}
+                      or (isinstance(data, dict) and data.get("ok") is False))
+        accepted = isinstance(response, dict) and response.get("ok") is True and not response.get("blocked")
+        if skipped:
+            _record(ctx, key, "events_skipped")
+        if failed:
+            ctx["publish_failed"] = True
+        if accepted:
+            _record(ctx, key, "events_sent_to_backend")
+        results.append({"attempted": True, "skipped": skipped, "sent_to_backend": accepted})
     summary = _summary_from_results(checked, results)
     _log_group_done(group, summary)
     return summary
@@ -857,6 +848,7 @@ def emit_additional_remaining_numbers_events(conn, ctx: dict):
 
 
 def emit_winner_defined_events(conn, ctx: dict):
+    ctx["conn"] = conn
     draws_cols = _table_columns(conn, "draws")
     if "id" not in draws_cols or "status" not in draws_cols:
         print("[push-automation] draws id/status columns not found")
@@ -934,25 +926,6 @@ def emit_winner_defined_events(conn, ctx: dict):
                 "winner_defined_outside_lookback",
             )
 
-    block = _large_batch_block_reason(
-        ctx,
-        "WINNER_DEFINED",
-        candidates_count,
-        ctx["config"]["winner_max_events_per_scan"],
-    )
-    if block:
-        reason, max_allowed = block
-        results = _block_large_batch(
-            ctx,
-            "WINNER_DEFINED",
-            candidates_count,
-            max_allowed,
-            reason,
-        )
-        summary = _summary_from_results(candidates_count, results)
-        _log_group_done("winner_defined", summary)
-        return summary
-
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT {', '.join(_quote_ident(column) for column in selected_cols)}
@@ -988,6 +961,7 @@ def emit_winner_defined_events(conn, ctx: dict):
 
 
 def emit_additional_winner_defined_events(conn, ctx: dict):
+    ctx["conn"] = conn
     draws_cols = _table_columns(conn, "draws")
     if not {"id", "draw_type"}.issubset(set(draws_cols)):
         print("[push-automation] additional winner draws id/draw_type columns not found")
@@ -1055,25 +1029,6 @@ def emit_additional_winner_defined_events(conn, ctx: dict):
                 ctx["config"]["winner_lookback_hours"],
                 "additional_winner_defined_outside_lookback",
             )
-
-    block = _large_batch_block_reason(
-        ctx,
-        "WINNER_DEFINED",
-        candidates_count,
-        ctx["config"]["winner_max_events_per_scan"],
-    )
-    if block:
-        reason, max_allowed = block
-        results = _block_large_batch(
-            ctx,
-            "WINNER_DEFINED",
-            candidates_count,
-            max_allowed,
-            reason,
-        )
-        summary = _summary_from_results(candidates_count, results)
-        _log_group_done("additional_winner_defined", summary)
-        return summary
 
     with conn.cursor() as cur:
         cur.execute(f"""

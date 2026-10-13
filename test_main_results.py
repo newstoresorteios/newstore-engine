@@ -21,6 +21,9 @@ class FakeConnection:
     def close(self):
         self.closed = True
 
+    def cursor(self):
+        return SequenceCursor([{"realized_at": datetime.now(timezone.utc)}])
+
 
 class RecordingCursor:
     def __init__(self, rows=None, rowcount=1):

@@ -250,7 +250,7 @@ def backend_owner(active, cutoff="2026-01-01T00:00:00Z"):
 
 
 def draw_dict(draw_id=150, draw_type="principal"):
-    return {"id": draw_id, "draw_type": draw_type, "status": "closed", "product_name": "Premio"}
+    return {"id": draw_id, "draw_type": draw_type, "status": "sorteado", "product_name": "Premio", "realized_at": REALIZED}
 
 
 def communications(flag, winner_user_id=11, notify_side_effect=None, loser_list=None, draw=None):

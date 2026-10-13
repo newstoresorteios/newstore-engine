@@ -92,7 +92,7 @@ def main() -> int:
             "events_sent_to_backend": summary.get("events_sent_to_backend", 0),
             "by_event_key": summary.get("by_event_key", {}),
         })
-        return 0
+        return 0 if summary.get("ok") is True else 1
     except Exception as exc:
         if conn is not None:
             try:
